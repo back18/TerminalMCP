@@ -1,0 +1,572 @@
+﻿using System;
+using System.Collections.Concurrent;
+using System.Text;
+using Microsoft.Extensions.Logging;
+using TerminalMCP.Interop;
+using TerminalMCP.Models;
+
+namespace TerminalMCP.Services.Implementations
+{
+    public class TerminalCaptureService : ITerminalCaptureService
+    {
+        public TerminalCaptureService(ILogger<TerminalCaptureService> logger, IClipboardService clipboardService)
+        {
+            ArgumentNullException.ThrowIfNull(logger, nameof(logger));
+            ArgumentNullException.ThrowIfNull(clipboardService, nameof(clipboardService));
+
+            _logger = logger;
+            _clipboardService = clipboardService;
+        }
+
+        private readonly ILogger<TerminalCaptureService> _logger;
+        private readonly IClipboardService _clipboardService;
+        private readonly ConcurrentDictionary<nint, string[]> _baselines = new();
+        private readonly ConcurrentDictionary<nint, TerminalInfo> _windowCache = new();
+        private readonly SemaphoreSlim _clipboardLock = new(1, 1);
+        private bool _disposed;
+
+        public IReadOnlyList<TerminalInfo> EnumerateWindows()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            List<TerminalInfo> results = [];
+            HashSet<nint> seen = [];
+            int totalWindows = 0;
+            int visibleWindows = 0;
+            int nonWtWindows = 0;
+
+            NativeMethods.EnumWindows((hWnd, _) =>
+            {
+                nint hwnd = hWnd;
+                totalWindows++;
+
+                if (seen.Contains(hwnd))
+                    return true;
+
+                if (!NativeMethods.IsWindowVisible(hWnd))
+                    return true;
+
+                visibleWindows++;
+
+                char[] classBuf = new char[256];
+                NativeMethods.GetClassNameW(hWnd, classBuf, classBuf.Length);
+                string className = new string(classBuf).TrimEnd('\0');
+
+                if (className != NativeMethods.WtClassName)
+                {
+                    nonWtWindows++;
+                    return true;
+                }
+
+                seen.Add(hwnd);
+
+                char[] titleBuf = new char[256];
+                NativeMethods.GetWindowTextW(hWnd, titleBuf, titleBuf.Length);
+                string title = new string(titleBuf).TrimEnd('\0');
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("EnumerateWindows: found WT window hwnd=0x{hwnd:X} title='{title}'", hwnd, title);
+
+                results.Add(new TerminalInfo(hwnd.ToInt32(), title, 0, string.Empty));
+                return true;
+            }, IntPtr.Zero);
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("EnumerateWindows: done - total={total} visible={visible} nonWt={nonWt} found={found}",
+                    totalWindows, visibleWindows, nonWtWindows, results.Count);
+
+            return results;
+        }
+
+        public IReadOnlyList<TerminalInfo> Init()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            List<TerminalInfo> results = [];
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Init: starting, cached windows={count}", _windowCache.Count);
+
+            // Get current WT windows
+            IReadOnlyList<TerminalInfo> currentWindows = EnumerateWindows();
+            HashSet<nint> currentHwnds = [.. currentWindows.Select(s => s.Hwnd)];
+
+            // Remove stale entries
+            foreach (nint hwnd in _windowCache.Keys)
+            {
+                if (!currentHwnds.Contains(hwnd))
+                {
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Init: removing stale window hwnd=0x{hwnd:X}", hwnd);
+                    _windowCache.TryRemove(hwnd, out _);
+                    _baselines.TryRemove(hwnd, out _);
+                }
+            }
+
+            // Discover new windows (incremental)
+            foreach (TerminalInfo info in currentWindows)
+            {
+                if (_windowCache.ContainsKey(info.Hwnd))
+                {
+                    // Update title only (window may have changed tabs)
+                    char[] titleBuf = new char[256];
+                    NativeMethods.GetWindowTextW(info.Hwnd, titleBuf, titleBuf.Length);
+                    string title = new string(titleBuf).TrimEnd('\0');
+
+                    TerminalInfo cached = _windowCache[info.Hwnd];
+                    TerminalInfo updated = cached with { Title = title };
+                    _windowCache[info.Hwnd] = updated;
+                    results.Add(updated);
+                }
+                else
+                {
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Init: new window hwnd=0x{hwnd:X} title='{title}' - capturing content", info.Hwnd, info.Title);
+
+                    // New window: capture content
+                    FocusWindow(info.Hwnd);
+                    string? text = CaptureContent();
+                    if (text is null)
+                    {
+                        _logger.LogWarning("Init: capture failed for hwnd=0x{hwnd:X}", info.Hwnd);
+                        results.Add(info);
+                        continue;
+                    }
+
+                    string[] lines = SplitLines(text);
+                    string tailPreview = string.Join("\n", lines[^Math.Min(20, lines.Length)..]);
+
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Init: captured hwnd=0x{hwnd:X} lines={lineCount}", info.Hwnd, lines.Length);
+
+                    TerminalInfo captured = new(info.Hwnd, info.Title, lines.Length, tailPreview);
+                    _windowCache[info.Hwnd] = captured;
+                    _baselines[info.Hwnd] = lines;
+                    results.Add(captured);
+                }
+            }
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Init: done - returned {count} windows", results.Count);
+
+            return results;
+        }
+
+        public ReadResult ReadContent(nint hwnd, int offset, int limit)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("ReadContent: hwnd=0x{hwnd:X} offset={offset} limit={limit}", hwnd, offset, limit);
+
+            if (!IsValidTerminalWindow(hwnd))
+            {
+                _logger.LogWarning("ReadContent: invalid window hwnd=0x{hwnd:X}", hwnd);
+                string title = GetWindowTitle(hwnd);
+                return new ReadResult(hwnd.ToInt32(), title, 0, 0, string.Empty);
+            }
+
+            string currentTitle = GetWindowTitle(hwnd);
+
+            if (!_baselines.TryGetValue(hwnd, out string[]? allLines))
+            {
+                // No baseline yet — capture once and establish it
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("ReadContent: hwnd=0x{hwnd:X} no baseline, capturing to establish", hwnd);
+
+                FocusWindow(hwnd);
+                string? text = CaptureContent();
+                if (text is null)
+                {
+                    _logger.LogWarning("ReadContent: capture failed for hwnd=0x{hwnd:X}", hwnd);
+                    return new ReadResult(hwnd.ToInt32(), currentTitle, 0, 0, string.Empty);
+                }
+
+                allLines = SplitLines(text);
+                _baselines[hwnd] = allLines;
+            }
+
+            int totalLines = allLines.Length;
+            int actualOffset = Math.Max(1, offset);
+            int actualLimit = Math.Max(1, limit);
+
+            string[] sliced = SliceLines(allLines, actualOffset, actualLimit);
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("ReadContent: hwnd=0x{hwnd:X} totalLines={totalLines} returned={returned}", hwnd, totalLines, sliced.Length);
+
+            return new ReadResult(hwnd.ToInt32(), currentTitle, totalLines, sliced.Length, string.Join("\n", sliced));
+        }
+
+        public DiffResult ReadDiff(nint hwnd)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X}", hwnd);
+
+            string currentTitle = GetWindowTitle(hwnd);
+
+            if (!IsValidTerminalWindow(hwnd))
+            {
+                _logger.LogWarning("ReadDiff: invalid window hwnd=0x{hwnd:X}", hwnd);
+                return new DiffResult(hwnd.ToInt32(), currentTitle, 0, "init", string.Empty, 0);
+            }
+
+            FocusWindow(hwnd);
+            string? text = CaptureContent();
+            if (text is null)
+            {
+                _logger.LogWarning("ReadDiff: capture failed for hwnd=0x{hwnd:X}", hwnd);
+                return new DiffResult(hwnd.ToInt32(), currentTitle, 0, "init", string.Empty, 0);
+            }
+
+            string[] currentLines = SplitLines(text);
+
+            if (!_baselines.TryGetValue(hwnd, out string[]? previousLines))
+            {
+                _baselines[hwnd] = currentLines;
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} init baseline, lines={count}", hwnd, currentLines.Length);
+                return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, "init",
+                    string.Join("\n", currentLines), currentLines.Length);
+            }
+
+            // Compare line by line from the beginning to find the first divergence
+            int divergeLine = 0;
+            int minLines = Math.Min(previousLines.Length, currentLines.Length);
+            while (divergeLine < minLines && previousLines[divergeLine] == currentLines[divergeLine])
+            {
+                divergeLine++;
+            }
+
+            // Old content is a prefix of new content — no divergence within old range
+            if (divergeLine >= previousLines.Length)
+            {
+                string[] appendedLines = currentLines[previousLines.Length..];
+                string diffText = string.Join("\n", appendedLines);
+                int newLineCount = appendedLines.Length;
+
+                _baselines[hwnd] = currentLines;
+
+                string status = newLineCount > 0 ? "new" : "no_change";
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} status={status} divergeLine={divergeLine} newLines={newCount}",
+                        hwnd, status, divergeLine, newLineCount);
+
+                return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, status, diffText, newLineCount);
+            }
+
+            // Divergence found within the overlapping range
+            // Return everything from the divergence point to the end
+            string[] newLines = currentLines[divergeLine..];
+            string fullDiffText = string.Join("\n", newLines);
+            int fullNewLineCount = newLines.Length;
+
+            _baselines[hwnd] = currentLines;
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} status=new divergeLine={divergeLine}/{prevLines} newLines={newCount}",
+                    hwnd, divergeLine, previousLines.Length, fullNewLineCount);
+
+            return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, "new", fullDiffText, fullNewLineCount);
+        }
+
+        public InputResult TypeText(nint hwnd, string text, bool pressEnter)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("TypeText: hwnd=0x{hwnd:X} textLen={len} pressEnter={enter}", hwnd, text.Length, pressEnter);
+
+            if (!IsValidTerminalWindow(hwnd))
+            {
+                _logger.LogWarning("TypeText: invalid window hwnd=0x{hwnd:X}", hwnd);
+                return new InputResult(false);
+            }
+
+            string? clipboardBackup = null;
+
+            _clipboardLock.Wait();
+            try
+            {
+                _clipboardService.TryReadText(out clipboardBackup);
+                if (!_clipboardService.TrySetText(text))
+                {
+                    _logger.LogWarning("TypeText: failed to set clipboard for hwnd=0x{hwnd:X}", hwnd);
+                    return new InputResult(false);
+                }
+
+                FocusWindow(hwnd);
+                Thread.Sleep(100);
+
+                // Ctrl+V
+                SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkV);
+                Thread.Sleep(100);
+
+                if (pressEnter)
+                {
+                    SendKey(NativeMethods.VkReturn);
+                    Thread.Sleep(30);
+                }
+
+                return new InputResult(true);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "TypeText: failed for hwnd=0x{hwnd:X}", hwnd);
+                return new InputResult(false);
+            }
+            finally
+            {
+                // Best-effort clipboard restore
+                try
+                {
+                    if (!string.IsNullOrEmpty(clipboardBackup))
+                        _clipboardService.TrySetText(clipboardBackup);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TypeText: failed to restore clipboard for hwnd=0x{hwnd:X}", hwnd);
+                }
+
+                _clipboardLock.Release();
+            }
+        }
+
+        public bool IsValidTerminalWindow(nint hwnd)
+        {
+            if (!NativeMethods.IsWindow(hwnd))
+                return false;
+
+            char[] classBuf = new char[256];
+            NativeMethods.GetClassNameW(hwnd, classBuf, classBuf.Length);
+            string className = new string(classBuf).TrimEnd('\0');
+
+            return className == NativeMethods.WtClassName;
+        }
+
+        public KeyResult SendKey(nint hwnd, string key)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (!IsValidTerminalWindow(hwnd))
+            {
+                _logger.LogWarning("SendKey: invalid window hwnd=0x{hwnd:X}", hwnd);
+                return new KeyResult(false, key);
+            }
+
+            try
+            {
+                int? vk = KeyNameToVk(key);
+                if (vk is null)
+                {
+                    _logger.LogWarning("SendKey: unknown key '{key}'", key);
+                    return new KeyResult(false, key);
+                }
+
+                FocusWindow(hwnd);
+                Thread.Sleep(50);
+                SendKey(vk.Value);
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("SendKey: sent key '{key}' (VK=0x{vk:X}) to hwnd=0x{hwnd:X}", key, vk.Value, hwnd);
+                return new KeyResult(true, key);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "SendKey: failed for hwnd=0x{hwnd:X} key='{key}'", hwnd, key);
+                return new KeyResult(false, key);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            _baselines.Clear();
+            _windowCache.Clear();
+            _clipboardLock.Dispose();
+
+            GC.SuppressFinalize(this);
+        }
+
+        private static void FocusWindow(nint hwnd)
+        {
+            if (NativeMethods.IsIconic(hwnd))
+            {
+                NativeMethods.ShowWindow(hwnd, NativeMethods.SwRestore);
+                Thread.Sleep(300);
+            }
+
+            NativeMethods.SetForegroundWindow(hwnd);
+            Thread.Sleep(200);
+        }
+
+        private string? CaptureContent()
+        {
+            // Phase 1: backup clipboard (lock-protected)
+            string? clipboardBackup = null;
+            _clipboardLock.Wait();
+            try
+            {
+                _clipboardService.TryReadText(out clipboardBackup);
+            }
+            finally
+            {
+                _clipboardLock.Release();
+            }
+
+            // Phase 2: send keystrokes (no lock needed — keyboard input is not clipboard)
+            try
+            {
+                // Ctrl+Shift+A (select all in Windows Terminal)
+                SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkShift, NativeMethods.VkA);
+                Thread.Sleep(150);
+
+                // Ctrl+C (copy)
+                SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkC);
+                Thread.Sleep(150);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "CaptureContent: keystroke send failed");
+                RestoreClipboard(clipboardBackup);
+                return null;
+            }
+
+            // Phase 3: read captured content + restore clipboard (lock-protected)
+            _clipboardLock.Wait();
+            try
+            {
+                if (!_clipboardService.TryReadText(out var result))
+                {
+                    _logger.LogWarning("CaptureContent: failed to read captured content from clipboard");
+                    RestoreClipboard(clipboardBackup);
+                    return null;
+                }
+
+                RestoreClipboard(clipboardBackup);
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "CaptureContent: clipboard operation failed");
+                RestoreClipboard(clipboardBackup);
+                return null;
+            }
+            finally
+            {
+                _clipboardLock.Release();
+            }
+        }
+
+        private void RestoreClipboard(string? text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return;
+
+            try
+            {
+                _clipboardService.TrySetText(text);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "RestoreClipboard: failed to restore clipboard content");
+            }
+        }
+
+        private static void SendKeyCombo(params int[] vks)
+        {
+            if (vks.Length == 0)
+                return;
+
+            // Press all keys
+            foreach (int vk in vks)
+            {
+                NativeMethods.keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(30);
+            }
+
+            Thread.Sleep(50);
+
+            // Release all keys in reverse order
+            for (int i = vks.Length - 1; i >= 0; i--)
+            {
+                NativeMethods.keybd_event((byte)vks[i], 0, NativeMethods.KeyeventfKeyup, UIntPtr.Zero);
+                Thread.Sleep(30);
+            }
+        }
+
+        private static void SendKey(int vk)
+        {
+            NativeMethods.keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
+            Thread.Sleep(30);
+            NativeMethods.keybd_event((byte)vk, 0, NativeMethods.KeyeventfKeyup, UIntPtr.Zero);
+            Thread.Sleep(30);
+        }
+
+        private static string[] SliceLines(string[] allLines, int offset, int limit)
+        {
+            // offset is 1-based from the end: offset=1 = last line
+            int startIdx = allLines.Length - offset - limit + 1;
+            if (startIdx < 0)
+            {
+                startIdx = 0;
+                limit = allLines.Length - offset + 1;
+                if (limit < 0)
+                    limit = 0;
+            }
+
+            int actualLimit = Math.Min(limit, allLines.Length - startIdx);
+            if (actualLimit <= 0)
+                return [];
+
+            string[] result = new string[actualLimit];
+            Array.Copy(allLines, startIdx, result, 0, actualLimit);
+            return result;
+        }
+
+        private static string[] SplitLines(string text)
+        {
+            return text.Split(["\r\n", "\n", "\r"], StringSplitOptions.None);
+        }
+
+        private static string GetWindowTitle(nint hwnd)
+        {
+            char[] titleBuf = new char[256];
+            NativeMethods.GetWindowTextW(hwnd, titleBuf, titleBuf.Length);
+            return new string(titleBuf).TrimEnd('\0');
+        }
+
+        private static int? KeyNameToVk(string key)
+        {
+            return key.ToLowerInvariant() switch
+            {
+                "enter" or "return" => NativeMethods.VkReturn,
+                "escape" or "esc" => NativeMethods.VkEscape,
+                "tab" => NativeMethods.VkTab,
+                "space" => NativeMethods.VkSpace,
+                "backspace" => NativeMethods.VkBack,
+                "delete" or "del" => NativeMethods.VkDelete,
+                "up" => NativeMethods.VkUp,
+                "down" => NativeMethods.VkDown,
+                "left" => NativeMethods.VkLeft,
+                "right" => NativeMethods.VkRight,
+                "home" => NativeMethods.VkHome,
+                "end" => NativeMethods.VkEnd,
+                "y" => NativeMethods.VkY,
+                "n" => NativeMethods.VkN,
+                "a" => NativeMethods.VkA,
+                "c" => NativeMethods.VkC,
+                "v" => NativeMethods.VkV,
+                "d" => NativeMethods.VkD,
+                "ctrl+a" => NativeMethods.VkA,  // selection conflicts with capture, handled separately if needed
+                _ => null,
+            };
+        }
+    }
+}

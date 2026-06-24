@@ -1,13 +1,13 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.Text;
+using TerminalMCP.Services;
+using TerminalMCP.Services.Implementations;
+using TerminalMCP.Tools;
 
 namespace TerminalMCP
 {
-    public class ConsoleApp : IServiceProvider
+    public class ConsoleApp
     {
         private ConsoleApp(string[]? args)
         {
@@ -19,16 +19,9 @@ namespace TerminalMCP
 
         private readonly IHost _host;
 
-        public static ConsoleApp Current
-        {
-            get => field ?? throw new InvalidOperationException("应用程序尚未初始化");
-            private set;
-        }
-
         public static ConsoleApp Create(string[]? args)
         {
-            Current = new ConsoleApp(args);
-            return Current;
+            return new ConsoleApp(args);
         }
 
         public Task RunAsync(CancellationToken cancellationToken = default)
@@ -49,21 +42,20 @@ namespace TerminalMCP
 
         private void ConfigureServices(IServiceCollection services)
         {
+            services.AddSingleton<IClipboardService, ClipboardService>();
+            services.AddSingleton<ITerminalCaptureService, TerminalCaptureService>();
+            services.AddSingleton<TerminalTools>();
+
             services.AddMcpServer(options =>
             {
                 options.ServerInfo = new()
                 {
-                    Name = "terminal",
+                    Name = "terminal_mcp",
                     Version = "1.0.0"
                 };
             })
             .WithStdioServerTransport()
             .WithToolsFromAssembly(typeof(ConsoleApp).Assembly);
-        }
-
-        public object? GetService(Type serviceType)
-        {
-            return _host.Services.GetService(serviceType);
         }
     }
 }
