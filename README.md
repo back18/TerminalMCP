@@ -8,7 +8,7 @@
 
 - **发现**所有已打开的 Windows Terminal 窗口（`terminal_init`）
 - **读取**缓冲内容，按行偏移定位（`terminal_read`）
-- **追踪**增量输出，基于 baseline 差分（`terminal_diff`）
+- **差分**输出，基于基线比对返回变更或新增内容（`terminal_diff`）
 - **输入**命令，通过剪贴板粘贴（`terminal_input`）
 - **发送按键**，响应交互式提示（`terminal_key`）
 
@@ -17,10 +17,10 @@
 | 工具 | 说明 |
 |------|------|
 | `terminal_init` | 发现所有 Windows Terminal 窗口并建立内容基线 |
-| `terminal_read` | 从内存缓存读取终端内容（不触碰终端窗口） |
-| `terminal_diff` | 捕获当前内容，仅返回上次基线之后的新增行 |
+| `terminal_read` | 从内存缓存读取终端内容（有缓存时不触碰终端窗口；无缓存时会自动捕获一次） |
+| `terminal_diff` | 捕获当前内容并与基线比对，返回变更部分。首次调用返回全部内容（`init`），无变化时返回空（`no_change`） |
 | `terminal_input` | 通过剪贴板粘贴将文本输入终端窗口 |
-| `terminal_key` | 发送单个按键（Enter、Esc、方向键、Y/N 等） |
+| `terminal_key` | 发送单个按键（Enter、Esc、Tab、Backspace、Delete、方向键、Home/End、Y/N、A/C/V/D 等） |
 
 ## 安装
 
@@ -36,31 +36,34 @@ cd TerminalMCP
 dotnet publish -c Release -o bin/Release/net10.0-windows/publish
 ```
 
-### 在 Hermes Agent 中配置
+### 配置 MCP 客户端
 
-添加到 `config.yaml`：
+#### 使用 `dotnet run`（从源码运行）：
 
-```yaml
-mcp_servers:
-  terminal-mcp:
-    command: dotnet
-    args:
-      - run
-      - --project
-      - D:/SourceCode/TS/TerminalMCP/TerminalMCP/TerminalMCP.csproj
-      - -c
-      - Release
-    enabled: true
+添加到 Claude Desktop (`claude_desktop_config.json`) 或 Claude Code (`.mcp.json`)：
+
+```json
+{
+  "mcpServers": {
+    "terminal-mcp": {
+      "command": "dotnet",
+      "args": ["run", "--project", "<repo-path>/TerminalMCP/TerminalMCP.csproj", "-c", "Release"]
+    }
+  }
+}
 ```
 
-或直接使用已发布的二进制文件：
+#### 使用已发布的二进制文件：
 
-```yaml
-mcp_servers:
-  terminal-mcp:
-    command: D:/SourceCode/TS/TerminalMCP/TerminalMCP/bin/Release/net10.0-windows/publish/TerminalMCP.exe
-    args: []
-    enabled: true
+```json
+{
+  "mcpServers": {
+    "terminal-mcp": {
+      "command": "<repo-path>/TerminalMCP/bin/Release/net10.0-windows/publish/TerminalMCP.exe",
+      "args": []
+    }
+  }
+}
 ```
 
 ## 使用
