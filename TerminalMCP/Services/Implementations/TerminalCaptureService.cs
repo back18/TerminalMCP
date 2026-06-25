@@ -192,10 +192,13 @@ namespace TerminalMCP.Services.Implementations
 
             string[] sliced = SliceLines(allLines, actualOffset, actualLimit);
 
+            // Prefix with descending line numbers (distance from bottom)
+            string readText = BuildLinesByDescending(sliced, actualOffset);
+
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("ReadContent: hwnd=0x{hwnd:X} totalLines={totalLines} returned={returned}", hwnd, totalLines, sliced.Length);
 
-            return new ReadResult(hwnd.ToInt32(), currentTitle, totalLines, sliced.Length, string.Join("\n", sliced));
+            return new ReadResult(hwnd.ToInt32(), currentTitle, totalLines, sliced.Length, readText);
         }
 
         public DiffResult ReadDiff(nint hwnd)
@@ -228,8 +231,11 @@ namespace TerminalMCP.Services.Implementations
                 _baselines[hwnd] = currentLines;
                 if (_logger.IsEnabled(LogLevel.Debug))
                     _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} init baseline, lines={count}", hwnd, currentLines.Length);
+
+                // Prefix with ascending absolute line numbers (1-based from top)
+                string initText = BuildLines(currentLines, 1);
                 return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, "init",
-                    string.Join("\n", currentLines), currentLines.Length);
+                    initText, currentLines.Length);
             }
 
             // Compare line by line from the beginning to find the first divergence
@@ -244,7 +250,7 @@ namespace TerminalMCP.Services.Implementations
             if (divergeLine >= previousLines.Length)
             {
                 string[] appendedLines = currentLines[previousLines.Length..];
-                string diffText = string.Join("\n", appendedLines);
+                string diffText = BuildLines(appendedLines, previousLines.Length + 1);
                 int newLineCount = appendedLines.Length;
 
                 _baselines[hwnd] = currentLines;
@@ -261,7 +267,7 @@ namespace TerminalMCP.Services.Implementations
             // Divergence found within the overlapping range
             // Return everything from the divergence point to the end
             string[] newLines = currentLines[divergeLine..];
-            string fullDiffText = string.Join("\n", newLines);
+            string fullDiffText = BuildLines(newLines, divergeLine + 1);
             int fullNewLineCount = newLines.Length;
 
             _baselines[hwnd] = currentLines;
@@ -533,6 +539,44 @@ namespace TerminalMCP.Services.Implementations
         private static string[] SplitLines(string text)
         {
             return text.Split(["\r\n", "\n", "\r"], StringSplitOptions.None);
+        }
+
+        private static string BuildLines(string[] lines, int start)
+        {
+            int line = start;
+            int width = (start + lines.Length - 1).ToString().Length;
+            StringBuilder stringBuilder = new();
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                stringBuilder.Append((line++).ToString().PadLeft(width));
+                stringBuilder.Append('|');
+                stringBuilder.AppendLine(lines[i]);
+            }
+
+            if (stringBuilder.Length > 0)
+                stringBuilder.Length--;
+
+            return stringBuilder.ToString();
+        }
+
+        private static string BuildLinesByDescending(string[] lines, int offset)
+        {
+            int line = lines.Length + offset - 1;
+            int width = line.ToString().Length;
+            StringBuilder stringBuilder = new();
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                stringBuilder.Append((line--).ToString().PadLeft(width));
+                stringBuilder.Append('|');
+                stringBuilder.AppendLine(lines[i]);
+            }
+
+            if (stringBuilder.Length > 0)
+                stringBuilder.Length--;
+
+            return stringBuilder.ToString();
         }
 
         private static string GetWindowTitle(nint hwnd)
