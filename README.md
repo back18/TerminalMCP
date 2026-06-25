@@ -17,8 +17,8 @@
 | 工具 | 说明 |
 |------|------|
 | `terminal_init` | 发现所有 Windows Terminal 窗口并建立内容基线 |
-| `terminal_read` | 从内存缓存读取终端内容，每行带倒序行号前缀（`offset|`，1=最后一行）。有缓存时不触碰终端窗口；无缓存时会自动捕获一次 |
-| `terminal_diff` | 捕获当前内容并与基线比对，返回变更部分，每行带绝对行号前缀（`57|`，1-based 从顶部起算）。首次调用返回全部内容（`init`），无变化时返回空（`no_change`） |
+| `terminal_read` | 从内存缓存读取终端内容，每行带倒序行号前缀（`offset`，1=最后一行）。有缓存时不触碰终端窗口；无缓存时会自动捕获一次 |
+| `terminal_diff` | 捕获当前内容并与基线比对，返回变更部分，每行带绝对行号前缀（`57`，1-based 从顶部起算）。首次调用返回全部内容（`init`），无变化时返回空（`no_change`） |
 | `terminal_input` | 通过剪贴板粘贴将文本输入终端窗口 |
 | `terminal_key` | 发送单个按键（Enter、Esc、Tab、Backspace、Delete、方向键、Home/End、Y/N、A/C/V/D 等） |
 
