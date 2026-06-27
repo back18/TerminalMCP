@@ -11,6 +11,8 @@ namespace TerminalMCP.Services
 
         public IReadOnlyList<TerminalInfo> Init();
 
+        public TerminalInfo? Init(nint hwnd);
+
         public ReadResult ReadContent(nint hwnd, int offset, int limit);
 
         public DiffResult ReadDiff(nint hwnd);

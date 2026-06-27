@@ -11,16 +11,20 @@
 - **差分**输出，基于基线比对返回变更或新增内容，带绝对行号前缀（`terminal_diff`）
 - **输入**命令，通过剪贴板粘贴（`terminal_input`）
 - **发送按键**，响应交互式提示（`terminal_key`）
+- **列出**可用的 Windows Terminal 配置文件（`terminal_list_profiles`）
+- **打开**新的 Windows Terminal 窗口（`terminal_open`）
 
 ## 工具
 
 | 工具 | 说明 |
 |------|------|
-| `terminal_init` | 发现所有 Windows Terminal 窗口并建立内容基线 |
+| `terminal_init` | 发现所有 Windows Terminal 窗口并建立内容基线。可传入 `hwnd` 仅初始化指定窗口 |
 | `terminal_read` | 从内存缓存读取终端内容，每行带倒序行号前缀（`offset`，1=最后一行）。有缓存时不触碰终端窗口；无缓存时会自动捕获一次 |
 | `terminal_diff` | 捕获当前内容并与基线比对，返回变更部分，每行带绝对行号前缀（`57`，1-based 从顶部起算）。首次调用返回全部内容（`init`），无变化时返回空（`no_change`） |
 | `terminal_input` | 通过剪贴板粘贴将文本输入终端窗口 |
 | `terminal_key` | 发送单个按键（Enter、Esc、Tab、Backspace、Delete、方向键、Home/End、Y/N、A/C/V/D 等） |
+| `terminal_list_profiles` | 列出可用的 Windows Terminal 配置文件（PowerShell、CMD、WSL 等） |
+| `terminal_open` | 打开新的 Windows Terminal 窗口，返回可用的 hwnd |
 
 ## 安装
 
@@ -83,6 +87,10 @@ terminal_input(hwnd, "echo hello")      → 输入命令
 terminal_diff(hwnd)                     → 增量输出，每行带绝对行号（57|TEST LINE...）
 terminal_key(hwnd, "enter")             → 确认交互式提示
 terminal_key(hwnd, "up")                → 菜单导航
+
+# 打开新终端窗口
+terminal_list_profiles()                        → 列出可用配置文件
+terminal_open("Windows PowerShell", "C:\\work")  → 打开新窗口并返回 hwnd
 ```
 
 ### 多窗口定位
@@ -109,9 +117,15 @@ terminal_key(hwnd, "escape") → 关闭提示
 │ TerminalMCP (.NET)   │     │ Win32 P/Invoke    │     │ 剪贴板          │
 │ (stdio MCP 服务器)   │ ──► │ (keybd_event)     │ ──► │ (STA 线程)      │
 │ init / read / diff / │     │ (SetForeground)   │     │                 │
-│ input / key          │     └──────────────────┘     └─────────────────┘
+│ input / key / open / │     └──────────────────┘     └─────────────────┘
+│ list_profiles        │
 └──────────────────────┘
-       ▲
+       ▲        │
+       │        │ wt.exe
+       │        ▼
+       │  ┌──────────┐
+       │  │ 新终端    │
+       │  └──────────┘
        │ MCP 协议 (stdio)
        │
 ┌──────┴───────────┐

@@ -35,4 +35,13 @@ namespace TerminalMCP.Models
 
     public record TerminalInitResult(
         [property: JsonPropertyName("terminals")] List<TerminalInfo> Terminals);
+
+    public record ProfileListResult(
+        [property: JsonPropertyName("profiles")] List<string> Profiles);
+
+    public record OpenResult(
+        [property: JsonPropertyName("hwnd")] int Hwnd,
+        [property: JsonPropertyName("title")] string Title,
+        [property: JsonPropertyName("line_count")] int LineCount,
+        [property: JsonPropertyName("tail_preview")] string TailPreview);
 }

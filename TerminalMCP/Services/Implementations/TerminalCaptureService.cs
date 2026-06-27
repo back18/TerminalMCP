@@ -48,9 +48,7 @@ namespace TerminalMCP.Services.Implementations
 
                 visibleWindows++;
 
-                char[] classBuf = new char[256];
-                NativeMethods.GetClassNameW(hWnd, classBuf, classBuf.Length);
-                string className = new string(classBuf).TrimEnd('\0');
+                string className = GetWindowClassName(hwnd);
 
                 if (className != NativeMethods.WtClassName)
                 {
@@ -60,9 +58,7 @@ namespace TerminalMCP.Services.Implementations
 
                 seen.Add(hwnd);
 
-                char[] titleBuf = new char[256];
-                NativeMethods.GetWindowTextW(hWnd, titleBuf, titleBuf.Length);
-                string title = new string(titleBuf).TrimEnd('\0');
+                string title = GetWindowTitle(hwnd);
 
                 if (_logger.IsEnabled(LogLevel.Debug))
                     _logger.LogDebug("EnumerateWindows: found WT window hwnd=0x{hwnd:X} title='{title}'", hwnd, title);
@@ -109,9 +105,7 @@ namespace TerminalMCP.Services.Implementations
                 if (_windowCache.ContainsKey(info.Hwnd))
                 {
                     // Update title only (window may have changed tabs)
-                    char[] titleBuf = new char[256];
-                    NativeMethods.GetWindowTextW(info.Hwnd, titleBuf, titleBuf.Length);
-                    string title = new string(titleBuf).TrimEnd('\0');
+                    string title = GetWindowTitle(info.Hwnd);
 
                     TerminalInfo cached = _windowCache[info.Hwnd];
                     TerminalInfo updated = cached with { Title = title };
@@ -120,19 +114,12 @@ namespace TerminalMCP.Services.Implementations
                 }
                 else
                 {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("Init: new window hwnd=0x{hwnd:X} title='{title}' - capturing content", info.Hwnd, info.Title);
+                    if (!IsValidTerminalWindow(info.Hwnd))
+                        continue;
 
                     // New window: capture content
                     FocusWindow(info.Hwnd);
-                    string? text = CaptureContent();
-                    if (text is null)
-                    {
-                        _logger.LogWarning("Init: capture failed for hwnd=0x{hwnd:X}", info.Hwnd);
-                        results.Add(info);
-                        continue;
-                    }
-
+                    string? text = CaptureContent() ?? string.Empty;
                     string[] lines = SplitLines(text);
                     string tailPreview = string.Join("\n", lines[^Math.Min(20, lines.Length)..]);
 
@@ -150,6 +137,33 @@ namespace TerminalMCP.Services.Implementations
                 _logger.LogDebug("Init: done - returned {count} windows", results.Count);
 
             return results;
+        }
+
+        public TerminalInfo? Init(nint hwnd)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (!IsValidTerminalWindow(hwnd))
+            {
+                _logger.LogWarning("InitWindow: invalid window hwnd=0x{hwnd:X}", hwnd);
+                return null;
+            }
+
+            string title = GetWindowTitle(hwnd);
+
+            FocusWindow(hwnd);
+            string? text = CaptureContent() ?? string.Empty;
+            string[] lines = SplitLines(text);
+            string tailPreview = string.Join("\n", lines[^Math.Min(20, lines.Length)..]);
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Init: captured hwnd=0x{hwnd:X} lines={lineCount}", hwnd, lines.Length);
+
+            TerminalInfo captured = new(hwnd.ToInt32(), title, lines.Length, tailPreview);
+            _windowCache[hwnd] = captured;
+            _baselines[hwnd] = lines;
+
+            return captured;
         }
 
         public ReadResult ReadContent(nint hwnd, int offset, int limit)
@@ -346,10 +360,7 @@ namespace TerminalMCP.Services.Implementations
             if (!NativeMethods.IsWindow(hwnd))
                 return false;
 
-            char[] classBuf = new char[256];
-            NativeMethods.GetClassNameW(hwnd, classBuf, classBuf.Length);
-            string className = new string(classBuf).TrimEnd('\0');
-
+            string className = GetWindowClassName(hwnd);
             return className == NativeMethods.WtClassName;
         }
 
@@ -400,16 +411,20 @@ namespace TerminalMCP.Services.Implementations
             GC.SuppressFinalize(this);
         }
 
-        private static void FocusWindow(nint hwnd)
+        private static bool FocusWindow(nint hwnd)
         {
+            if (!NativeMethods.IsWindow(hwnd))
+                return false;
+
             if (NativeMethods.IsIconic(hwnd))
             {
                 NativeMethods.ShowWindow(hwnd, NativeMethods.SwRestore);
                 Thread.Sleep(300);
             }
 
-            NativeMethods.SetForegroundWindow(hwnd);
+            bool result = NativeMethods.SetForegroundWindow(hwnd);
             Thread.Sleep(200);
+            return result;
         }
 
         private string? CaptureContent()
@@ -538,7 +553,16 @@ namespace TerminalMCP.Services.Implementations
 
         private static string[] SplitLines(string text)
         {
-            return text.Split(["\r\n", "\n", "\r"], StringSplitOptions.None);
+            string[] lines = text.Split(["\r\n", "\n", "\r"], StringSplitOptions.None);
+
+            int lastNonEmpty = lines.Length - 1;
+            while (lastNonEmpty >= 0 && string.IsNullOrEmpty(lines[lastNonEmpty]))
+                lastNonEmpty--;
+
+            if (lastNonEmpty == lines.Length - 1)
+                return lines;
+
+            return lines[..(lastNonEmpty + 1)];
         }
 
         private static string BuildLines(string[] lines, int start)
@@ -586,6 +610,13 @@ namespace TerminalMCP.Services.Implementations
             return new string(titleBuf).TrimEnd('\0');
         }
 
+        private static string GetWindowClassName(nint hwnd)
+        {
+            char[] classBuf = new char[256];
+            NativeMethods.GetClassNameW(hwnd, classBuf, classBuf.Length);
+            return new string(classBuf).TrimEnd('\0');
+        }
+
         private static int? KeyNameToVk(string key)
         {
             return key.ToLowerInvariant() switch
@@ -608,7 +639,6 @@ namespace TerminalMCP.Services.Implementations
                 "c" => NativeMethods.VkC,
                 "v" => NativeMethods.VkV,
                 "d" => NativeMethods.VkD,
-                "ctrl+a" => NativeMethods.VkA,  // selection conflicts with capture, handled separately if needed
                 _ => null,
             };
         }

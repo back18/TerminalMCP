@@ -16,16 +16,22 @@ namespace TerminalMCP.Tools
     [McpServerToolType]
     public class TerminalTools
     {
-        public TerminalTools(ITerminalCaptureService captureService, ILogger<TerminalTools> logger)
+        public TerminalTools(
+            ITerminalCaptureService captureService,
+            ITerminalProcessService processService,
+            ILogger<TerminalTools> logger)
         {
             ArgumentNullException.ThrowIfNull(captureService, nameof(captureService));
+            ArgumentNullException.ThrowIfNull(processService, nameof(processService));
             ArgumentNullException.ThrowIfNull(logger, nameof(logger));
 
             _captureService = captureService;
+            _processService = processService;
             _logger = logger;
         }
 
         private readonly ITerminalCaptureService _captureService;
+        private readonly ITerminalProcessService _processService;
         private readonly ILogger<TerminalTools> _logger;
 
         private static readonly JsonSerializerOptions JsonOptions = new()
@@ -35,13 +41,36 @@ namespace TerminalMCP.Tools
         };
 
         [McpServerTool(Name = "terminal_init")]
-        [Description("Discovers Windows Terminal windows and establishes content baselines for diff tracking. New windows are captured and their baselines saved; known windows only update their titles. WARNING: For new windows, this will switch window focus and use the clipboard (Ctrl+Shift+A, Ctrl+C) to capture content — avoid interacting with the terminal during this call. Call this first before terminal_diff or terminal_read.")]
-        public string TerminalInit()
+        [Description("Discovers Windows Terminal windows and establishes content baselines for diff tracking. New windows are captured and their baselines saved. WARNING: For new windows, this will switch window focus and use the clipboard (Ctrl+Shift+A, Ctrl+C) to capture content — avoid interacting with the terminal during this call. Call this first to discover available windows and obtain hwnd values for use with other tools. (terminal_read and terminal_diff will auto-establish baselines if none exist, but you need an hwnd to target.) If hwnd is provided, initializes only that specific window — useful after terminal_open.")]
+        public string TerminalInit(
+            [Description("Optional window handle to initialize a specific window. 0 (default) discovers all windows.")] int hwnd = 0)
         {
             Stopwatch stopwatch = Stopwatch.StartNew();
 
             try
             {
+                // Single-window init
+                if (hwnd != 0)
+                {
+                    nint handle = (nint)hwnd;
+                    TerminalInfo? info = _captureService.Init(handle);
+                    if (info is null)
+                        return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                            ErrorCodes.WindowNotTerminal,
+                            $"hwnd {hwnd} is not a valid Windows Terminal window",
+                            "Call terminal_init without hwnd to discover available windows"),
+                            JsonOptions);
+
+                    return JsonSerializer.Serialize(ToolResponse<TerminalInitResult>.Ok(
+                        new TerminalInitResult([info]),
+                        new ResponseMetadata
+                        {
+                            ExecutionTimeMs = stopwatch.ElapsedMilliseconds
+                        }),
+                        JsonOptions);
+                }
+
+                // Discover all windows
                 IReadOnlyList<TerminalInfo> terminals = _captureService.Init();
 
                 if (terminals.Count == 0)
@@ -78,7 +107,7 @@ namespace TerminalMCP.Tools
         }
 
         [McpServerTool(Name = "terminal_read")]
-        [Description("Reads terminal content from the cached baseline (established by terminal_init or a previous call). offset=1 means the last line (1-based from end). No terminal interaction — reads from memory only.")]
+        [Description("Reads terminal content from the cached baseline (established by terminal_init, terminal_init(hwnd), or terminal_open). Falls back to a full capture (focus switch + clipboard) if no baseline exists yet. offset=1 means the last line (1-based from end).")]
         public string TerminalRead(
             [Description("Target window handle")] int hwnd,
             [Description("Starting position from the last line (1=last line)")] int offset = 1,
@@ -93,7 +122,7 @@ namespace TerminalMCP.Tools
                     return JsonSerializer.Serialize(ToolResponse<object>.Fail(
                         ErrorCodes.WindowNotTerminal,
                         $"hwnd {hwnd} is not a valid Windows Terminal window",
-                        "Call terminal_init to discover available terminal windows"),
+                        "Call terminal_init to discover windows, or terminal_open to open a new one"),
                         JsonOptions);
                 }
 
@@ -118,7 +147,7 @@ namespace TerminalMCP.Tools
         }
 
         [McpServerTool(Name = "terminal_diff")]
-        [Description("Captures current terminal content via clipboard, then compares against the stored baseline using line-by-line prefix matching. Returns only lines appended since the last baseline snapshot. The baseline is updated to the current content after each call. Status values: 'init' (first capture or baseline reset), 'new' (new lines found), 'no_change' (content unchanged).")]
+        [Description("Captures current terminal content via clipboard (Ctrl+Shift+A, Ctrl+C), then compares against the stored baseline using line-by-line prefix matching. Auto-establishes a baseline and returns all content as 'init' if no baseline exists. Returns new or changed lines since the last baseline snapshot. The baseline is updated to the current content after each call. Status values: 'init' (first capture, no baseline exists), 'new' (new or changed lines found), 'no_change' (content unchanged). WARNING: switches window focus and uses clipboard — avoid calling while the user is typing.")]
         public string TerminalDiff(
             [Description("Target window handle")] int hwnd)
         {
@@ -131,7 +160,7 @@ namespace TerminalMCP.Tools
                     return JsonSerializer.Serialize(ToolResponse<object>.Fail(
                         ErrorCodes.WindowNotTerminal,
                         $"hwnd {hwnd} is not a valid Windows Terminal window",
-                        "Call terminal_init to discover available terminal windows"),
+                        "Call terminal_init to discover windows, or terminal_open to open a new one"),
                         JsonOptions);
                 }
 
@@ -156,7 +185,7 @@ namespace TerminalMCP.Tools
         }
 
         [McpServerTool(Name = "terminal_input")]
-        [Description("Types text into a terminal window via clipboard paste. Optionally presses Enter after pasting.")]
+        [Description("Types text into a terminal window via clipboard paste (Ctrl+V). Optionally presses Enter after pasting. WARNING: switches window focus and temporarily overwrites clipboard content.")]
         public string TerminalInput(
             [Description("Target window handle")] int hwnd,
             [Description("Text to type into the terminal")] string text,
@@ -171,7 +200,7 @@ namespace TerminalMCP.Tools
                     return JsonSerializer.Serialize(ToolResponse<object>.Fail(
                         ErrorCodes.WindowNotTerminal,
                         $"hwnd {hwnd} is not a valid Windows Terminal window",
-                        "Call terminal_init to discover available terminal windows"),
+                        "Call terminal_init to discover windows, or terminal_open to open a new one"),
                         JsonOptions);
                 }
 
@@ -213,10 +242,10 @@ namespace TerminalMCP.Tools
         }
 
         [McpServerTool(Name = "terminal_key")]
-        [Description("Sends a single key press to a terminal window. Supports common keys: enter, escape, tab, space, backspace, delete, up, down, left, right, home, end, y, n. Used for interactive prompts (confirmations, menu navigation).")]
+        [Description("Sends a single key press to a terminal window. Used for interactive prompts (confirmations, menu navigation, raw input). See parameter description for supported key names.")]
         public string TerminalKey(
             [Description("Target window handle")] int hwnd,
-            [Description("Key name to press (case-insensitive): enter, escape, tab, space, backspace, up, down, left, right, y, n, etc.")] string key)
+            [Description("Key name to press (case-insensitive): enter/return, escape/esc, tab, space, backspace, delete/del, up, down, left, right, home, end, y, n, a, c, v, d")] string key)
         {
             Stopwatch stopwatch = Stopwatch.StartNew();
 
@@ -227,7 +256,7 @@ namespace TerminalMCP.Tools
                     return JsonSerializer.Serialize(ToolResponse<object>.Fail(
                         ErrorCodes.WindowNotTerminal,
                         $"hwnd {hwnd} is not a valid Windows Terminal window",
-                        "Call terminal_init to discover available terminal windows"),
+                        "Call terminal_init to discover windows, or terminal_open to open a new one"),
                         JsonOptions);
                 }
 
@@ -264,6 +293,97 @@ namespace TerminalMCP.Tools
                     ErrorCodes.InputFailed,
                     "Failed to send key",
                     "The terminal window may have been closed"),
+                    JsonOptions);
+            }
+        }
+
+        [McpServerTool(Name = "terminal_list_profiles")]
+        [Description("Lists available Windows Terminal profiles (PowerShell, CMD, Ubuntu, VS Developer Shells, etc.) for use with terminal_open. Reads from the Windows Terminal settings.json once at startup.")]
+        public string TerminalListProfiles()
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                IReadOnlyList<string> profiles = _processService.GetProfiles();
+
+                return JsonSerializer.Serialize(ToolResponse<ProfileListResult>.Ok(
+                    new ProfileListResult([.. profiles]),
+                    new ResponseMetadata
+                    {
+                        ExecutionTimeMs = stopwatch.ElapsedMilliseconds
+                    }),
+                    JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "terminal_list_profiles failed");
+
+                return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                    ErrorCodes.ProfileNotFound,
+                    "Failed to list terminal profiles",
+                    "Check that Windows Terminal is installed"),
+                    JsonOptions);
+            }
+        }
+
+        [McpServerTool(Name = "terminal_open")]
+        [Description("Opens a new Windows Terminal window with the specified profile and optional working directory. Defaults to 'Windows PowerShell'. Discovers the new window, captures its content (WARNING: switches focus and uses clipboard), and returns the hwnd for use with terminal_read/diff/input/key. Use terminal_list_profiles to see available profile names.")]
+        public string TerminalOpen(
+            [Description("Profile name (from terminal_list_profiles). Defaults to 'Windows PowerShell'.")] string profile = "Windows PowerShell",
+            [Description("Working directory for the new terminal")] string? workingDirectory = null)
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            if (!string.IsNullOrEmpty(workingDirectory) && !Directory.Exists(workingDirectory))
+            {
+                return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                    ErrorCodes.DirectoryNotFound,
+                    $"Working directory '{workingDirectory}' does not exist",
+                    "Provide a valid existing directory or omit the parameter"),
+                    JsonOptions);
+            }
+
+            try
+            {
+                nint hwnd = _processService.Open(profile, workingDirectory);
+                if (hwnd == nint.Zero)
+                {
+                    return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                        ErrorCodes.OpenFailed,
+                        "Failed to open terminal window",
+                        "The new terminal window could not be detected. Try launching Windows Terminal manually, then use terminal_init to connect"),
+                        JsonOptions);
+                }
+
+                // Wait a moment for the terminal content to be ready before capturing
+                Thread.Sleep(1000);
+
+                TerminalInfo? result = _captureService.Init(hwnd);
+                if (result is null)
+                {
+                    return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                        ErrorCodes.OpenFailed,
+                        "Failed to capture new terminal window",
+                        $"The new terminal window (handle: 0x{hwnd:X}) may have closed before it could be captured"),
+                        JsonOptions);
+                }
+
+                OpenResult openResult = new(result.Hwnd, result.Title, result.LineCount, result.TailPreview);
+                return JsonSerializer.Serialize(ToolResponse<OpenResult>.Ok(openResult, new ResponseMetadata
+                {
+                    ExecutionTimeMs = stopwatch.ElapsedMilliseconds
+                }),
+                JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "terminal_open failed");
+
+                return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                    ErrorCodes.OpenFailed,
+                    "Failed to open terminal window",
+                    "An unexpected error occurred. Check inner exception for details"),
                     JsonOptions);
             }
         }

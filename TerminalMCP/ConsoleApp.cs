@@ -44,6 +44,7 @@ namespace TerminalMCP
         {
             services.AddSingleton<IClipboardService, ClipboardService>();
             services.AddSingleton<ITerminalCaptureService, TerminalCaptureService>();
+            services.AddSingleton<ITerminalProcessService, TerminalProcessService>();
             services.AddSingleton<TerminalTools>();
 
             services.AddMcpServer(options =>

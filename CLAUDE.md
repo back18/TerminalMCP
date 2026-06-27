@@ -28,10 +28,12 @@ dotnet publish TerminalMCP/TerminalMCP.csproj -c Release -o TerminalMCP/bin/Rele
 ```
 Program.cs (入口)
   └─ ConsoleApp.cs (Host 构建器，DI 注册，MCP 服务器配置)
-       └─ Tools/TerminalTools.cs (5 个 MCP 工具方法)
-            └─ Services/ITerminalCaptureService.cs (终端交互核心)
-                 ├─ Interop/NativeMethods.cs (Win32 P/Invoke)
-                 └─ Services/IClipboardService.cs (剪贴板读写)
+       └─ Tools/TerminalTools.cs (7 个 MCP 工具方法)
+            ├─ Services/ITerminalCaptureService.cs (终端交互核心)
+            │    ├─ Interop/NativeMethods.cs (Win32 P/Invoke)
+            │    └─ Services/IClipboardService.cs (剪贴板读写)
+            └─ Services/ITerminalProcessService.cs (终端进程管理)
+                 └─ 读取 WT settings.json / 启动 wt.exe
 ```
 
 ### MCP 工具详解
@@ -40,14 +42,15 @@ Program.cs (入口)
 
 #### terminal_init — 终端发现与基线建立
 
-**方法**: `TerminalInit()`，无参数。
+**方法**: `TerminalInit(int hwnd = 0)`。`hwnd` 为 0 时发现所有窗口；非 0 时仅初始化指定窗口（配合 `terminal_open` 使用）。
 
 **流程**:
-1. 调用 `EnumerateWindows()` — 通过 `EnumWindows` 枚举所有顶层窗口，筛选窗口类名为 `CASCADIA_HOSTING_WINDOW_CLASS` 的可见窗口
-2. 对于已在 `_windowCache` 中的已知窗口，只更新标题（从 `GetWindowTextW` 获取）
-3. 对于新发现的窗口，执行完整捕获流程：`FocusWindow` → `CaptureContent`（Ctrl+Shift+A 全选 → Ctrl+C 复制 → 读剪贴板 → 恢复剪贴板）→ 按换行符分割为 `string[]` 存入 `_baselines` → 取尾部 20 行作为 `tail_preview`
-4. 清理 `_windowCache` 中已不存在的过期窗口
-5. 返回 `TerminalInitResult`，包含所有窗口的 `hwnd`、`title`、`line_count`、`tail_preview`
+1. 若 `hwnd != 0` → 单窗口模式：验证窗口 → 聚焦 → 捕获内容 → 建立基线 → 返回 `TerminalInfo?`
+2. 调用 `EnumerateWindows()` — 通过 `EnumWindows` 枚举所有顶层窗口，筛选窗口类名为 `CASCADIA_HOSTING_WINDOW_CLASS` 的可见窗口
+3. 对于已在 `_windowCache` 中的已知窗口，只更新标题（从 `GetWindowTextW` 获取）
+4. 对于新发现的窗口，执行完整捕获流程：`FocusWindow` → `CaptureContent`（Ctrl+Shift+A 全选 → Ctrl+C 复制 → 读剪贴板 → 恢复剪贴板）→ 按换行符分割为 `string[]` 存入 `_baselines` → 取尾部 20 行作为 `tail_preview`
+5. 清理 `_windowCache` 中已不存在的过期窗口
+6. 返回 `TerminalInitResult`，包含所有窗口的 `hwnd`、`title`、`line_count`、`tail_preview`
 
 **副作用**: 对新窗口会切换窗口焦点并使用剪贴板；对已知窗口无副作用。
 
@@ -102,6 +105,33 @@ Program.cs (入口)
 
 **实现位置**: `TerminalCaptureService.SendKey()`。组合键（如 `Ctrl+V`）通过 `SendKeyCombo` 实现：先按顺序按下所有键，再按逆序释放。
 
+#### terminal_list_profiles — 列出可用配置文件
+
+**方法**: `TerminalListProfiles()`，无参数。
+
+**流程**:
+1. 调用 `_processService.GetProfiles()` 返回可用配置名列表
+2. `TerminalProcessService` 在构造时读取 WT 的 `settings.json`，从 `profiles.list` 中提取 `name` 和 `guid`
+3. 若 settings.json 找不到，回退返回硬编码的默认配置名列表
+4. 返回 `ProfileListResult`：`profiles` 字符串数组
+
+**特点**: 纯内存操作，数据在服务构造时一次性加载，不触碰终端或文件系统。
+
+#### terminal_open — 打开新终端窗口
+
+**方法**: `TerminalOpen(string profile = "Windows PowerShell", string? workingDirectory = null)`
+
+**流程**:
+1. 验证 `workingDirectory`（若提供）是否存在
+2. 通过 `_processService.Open(profile, workingDirectory)` 启动 `wt.exe -p "{profile}" [-d "{dir}"]`
+3. 启动前拍快照记录现有 WT 窗口集合，启动后轮询检测新增窗口（最多 10 次 × 500ms）
+4. 检测到新窗口后等待 1s，调用 `_captureService.Init(hwnd)` 建立基线
+5. 返回 `OpenResult`：`hwnd`、`title`、`line_count`、`tail_preview`
+
+**副作用**: 启动新 WT 进程，会切换窗口焦点并使用剪贴板建立基线。`workingDirectory` 需为已存在的目录。
+
+**实现位置**: `TerminalProcessService.LaunchTerminal()` 通过 `Process.Start` + `UseShellExecute` 启动 `wt.exe`。
+
 ### 关键设计决策
 
 - **MCP 传输**：stdio JSON-RPC，由 `ModelContextProtocol` 库处理协议层
@@ -120,6 +150,7 @@ Program.cs (入口)
 |:---|:---|:---|
 | `IClipboardService` → `ClipboardService` | Singleton | STA 线程剪贴板读写 |
 | `ITerminalCaptureService` → `TerminalCaptureService` | Singleton | 窗口枚举、内容捕获、diff、输入 |
+| `ITerminalProcessService` → `TerminalProcessService` | Singleton | WT 配置文件读取、启动新终端窗口 |
 | `TerminalTools` | Singleton | MCP 工具注册，JSON 序列化响应 |
 
 ### 线程安全

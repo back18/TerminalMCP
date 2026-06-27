@@ -19,5 +19,11 @@ namespace TerminalMCP.Models
         public const string InvalidParameter = "INVALID_PARAMETER";
 
         public const string NoTerminalWindows = "NO_TERMINAL_WINDOWS";
+
+        public const string OpenFailed = "OPEN_FAILED";
+
+        public const string DirectoryNotFound = "DIRECTORY_NOT_FOUND";
+
+        public const string ProfileNotFound = "PROFILE_NOT_FOUND";
     }
 }
