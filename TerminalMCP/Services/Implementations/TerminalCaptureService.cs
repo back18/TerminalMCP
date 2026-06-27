@@ -20,11 +20,14 @@ namespace TerminalMCP.Services.Implementations
             _clipboardLockService = clipboardLockService;
         }
 
+        private const int DiffCooldownMs = 5000;
+
         private readonly ILogger<TerminalCaptureService> _logger;
         private readonly IClipboardService _clipboardService;
         private readonly IClipboardLockService _clipboardLockService;
         private readonly ConcurrentDictionary<nint, string[]> _baselines = new();
         private readonly ConcurrentDictionary<nint, TerminalInfo> _windowCache = new();
+        private readonly ConcurrentDictionary<nint, DateTime> _diffCooldowns = new();
         private bool _disposed;
 
         public IReadOnlyList<TerminalInfo> EnumerateWindows()
@@ -221,6 +224,22 @@ namespace TerminalMCP.Services.Implementations
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
+            // Per-hwnd cooldown: if called within 5s of the last diff for this window, wait
+            DateTime now = DateTime.UtcNow;
+            if (_diffCooldowns.TryGetValue(hwnd, out DateTime lastDiff))
+            {
+                int remaining = DiffCooldownMs - (int)(now - lastDiff).TotalMilliseconds;
+                if (remaining > 0)
+                {
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} cooldown, waiting {remaining}ms", hwnd, remaining);
+
+                    Thread.Sleep(remaining);
+                }
+            }
+
+            _diffCooldowns[hwnd] = DateTime.UtcNow;
+
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X}", hwnd);
 
@@ -312,6 +331,7 @@ namespace TerminalMCP.Services.Implementations
             _disposed = true;
             _baselines.Clear();
             _windowCache.Clear();
+            _diffCooldowns.Clear();
 
             GC.SuppressFinalize(this);
         }

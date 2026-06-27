@@ -151,7 +151,7 @@ namespace TerminalMCP.Tools
         }
 
         [McpServerTool(Name = "terminal_diff")]
-        [Description("Captures current terminal content via clipboard (Ctrl+Shift+A, Ctrl+C), then compares against the stored baseline using line-by-line prefix matching. Auto-establishes a baseline and returns all content as 'init' if no baseline exists. Returns new or changed lines since the last baseline snapshot. The baseline is updated to the current content after each call. Status values: 'init' (first capture, no baseline exists), 'new' (new or changed lines found), 'no_change' (content unchanged). WARNING: switches window focus and uses clipboard — avoid calling while the user is typing.")]
+        [Description("Captures current terminal content via clipboard (Ctrl+Shift+A, Ctrl+C), then compares against the stored baseline using line-by-line prefix matching. Auto-establishes a baseline and returns all content as 'init' if no baseline exists. Returns new or changed lines since the last baseline snapshot. The baseline is updated to the current content after each call. Has a 5s per-window cooldown — rapid repeated calls to the same hwnd will block internally until the cooldown expires. Status values: 'init' (first capture, no baseline exists), 'new' (new or changed lines found), 'no_change' (content unchanged). WARNING: switches window focus and uses clipboard — avoid calling while the user is typing.")]
         public string TerminalDiff(
             [Description("Target window handle")] int hwnd)
         {

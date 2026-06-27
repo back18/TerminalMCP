@@ -86,7 +86,7 @@ Program.cs (入口)
 4. 更新 `_baselines` 为最新内容
 5. 返回 `DiffResult`：`status` 为 `"init"`（首次捕获，无基线）/ `"new"`（有新行或变更行）/ `"no_change"`（内容未变），`text` 为新内容（每行带绝对行号前缀，如 `57|TEST LINE...`），`new_line_count` 为新行数
 
-**特点**: 必须与终端交互（聚焦 + 捕获），会短暂占用剪贴板。`"no_change"` 状态时 `text` 为空字符串。
+**特点**: 必须与终端交互（聚焦 + 捕获），会短暂占用剪贴板。`"no_change"` 状态时 `text` 为空字符串。内置每窗口 5 秒冷却（`_diffCooldowns`），同一 hwnd 在冷却时间内重复调用会 Sleep 等待，避免 AI 高频轮询浪费 Token。
 
 #### terminal_input — 文本输入
 
@@ -148,6 +148,7 @@ Program.cs (入口)
 - **捕获与输入分离**：`TerminalCaptureService`（只读观测）与 `TerminalInputService`（写入操作）为同级服务，通过共享 `IClipboardLockService` 互斥访问剪贴板
 - **剪贴板线程模型**：`ClipboardService` 在 STA 线程上执行剪贴板操作（Windows 剪贴板 API 要求）
 - **剪贴板锁**：`IClipboardLockService` → `ClipboardLockService`（单例 `SemaphoreSlim(1,1)`），同时注入 Capture 和 Input 两个服务，确保"备份→操作→恢复"原子性
+- **diff 冷却**：每个 hwnd 独立 5 秒冷却（`ConcurrentDictionary<nint, DateTime>`），同一窗口高频调用 `terminal_diff` 时内部 Sleep 等待，减少无意义的剪贴板操作和 Token 消耗
 - **diff 算法**：行级前缀比对 — 从第一行开始逐行比较新旧内容，找到第一个分叉点
 - **单实例**：通过 named mutex (`Local\TerminalMCP_{hash}`) 确保每目录只运行一个实例
 - **日志**：使用 log4net，stdout 被 MCP JSON-RPC 占用，console appender 已注释，日志写入 `Logs/Latest.log` 和 `Logs/Debug.log`
