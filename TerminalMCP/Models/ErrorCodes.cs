@@ -25,5 +25,7 @@ namespace TerminalMCP.Models
         public const string DirectoryNotFound = "DIRECTORY_NOT_FOUND";
 
         public const string ProfileNotFound = "PROFILE_NOT_FOUND";
+
+        public const string CloseFailed = "CLOSE_FAILED";
     }
 }

@@ -44,4 +44,8 @@ namespace TerminalMCP.Models
         [property: JsonPropertyName("title")] string Title,
         [property: JsonPropertyName("line_count")] int LineCount,
         [property: JsonPropertyName("tail_preview")] string TailPreview);
+
+    public record CloseResult(
+        [property: JsonPropertyName("hwnd")] int Hwnd,
+        [property: JsonPropertyName("success")] bool Success);
 }

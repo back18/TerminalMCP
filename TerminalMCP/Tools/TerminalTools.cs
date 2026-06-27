@@ -57,12 +57,22 @@ namespace TerminalMCP.Tools
                 if (hwnd != 0)
                 {
                     nint handle = (nint)hwnd;
-                    TerminalInfo? info = _captureService.Init(handle);
-                    if (info is null)
+
+                    if (!_captureService.IsValidTerminalWindow(handle))
+                    {
                         return JsonSerializer.Serialize(ToolResponse<object>.Fail(
                             ErrorCodes.WindowNotTerminal,
                             $"hwnd {hwnd} is not a valid Windows Terminal window",
                             "Call terminal_init without hwnd to discover available windows"),
+                            JsonOptions);
+                    }
+
+                    TerminalInfo? info = _captureService.Init(handle);
+                    if (info is null)
+                        return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                            ErrorCodes.CaptureFailed,
+                            $"Failed to capture window hwnd {hwnd}",
+                            "The window may have closed before content could be captured"),
                             JsonOptions);
 
                     return JsonSerializer.Serialize(ToolResponse<TerminalInitResult>.Ok(
@@ -388,6 +398,56 @@ namespace TerminalMCP.Tools
                     ErrorCodes.OpenFailed,
                     "Failed to open terminal window",
                     "An unexpected error occurred. Check inner exception for details"),
+                    JsonOptions);
+            }
+        }
+
+        [McpServerTool(Name = "terminal_close")]
+        [Description("Closes a Windows Terminal window by the given hwnd. Tries WM_CLOSE (non-intrusive, works when MCP and terminal run at same privilege level), then falls back to Alt+F4 via key injection (handles UIPI-blocked windows). Returns success true/false. WARNING: fallback path switches window focus and sends keystrokes.")]
+        public string TerminalClose(
+            [Description("Window handle to close")] int hwnd)
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                if (!_captureService.IsValidTerminalWindow(hwnd))
+                {
+                    return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                        ErrorCodes.WindowNotTerminal,
+                        $"hwnd {hwnd} is not a valid Windows Terminal window",
+                        "Call terminal_init to discover windows"),
+                        JsonOptions);
+                }
+
+                nint handle = (nint)hwnd;
+                bool success = _processService.CloseTerminal(handle);
+
+                if (success)
+                {
+                    return JsonSerializer.Serialize(ToolResponse<CloseResult>.Ok(
+                        new CloseResult(hwnd, true),
+                        new ResponseMetadata
+                        {
+                            ExecutionTimeMs = stopwatch.ElapsedMilliseconds
+                        }),
+                        JsonOptions);
+                }
+
+                return JsonSerializer.Serialize(ToolResponse<CloseResult>.Fail(
+                    ErrorCodes.CloseFailed,
+                    $"Failed to close window hwnd {hwnd}",
+                    "Window exists but did not respond to WM_CLOSE or Alt+F4"),
+                    JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "terminal_close failed for hwnd={hwnd}", hwnd);
+
+                return JsonSerializer.Serialize(ToolResponse<object>.Fail(
+                    ErrorCodes.CloseFailed,
+                    "Failed to close terminal window",
+                    "An unexpected error occurred"),
                     JsonOptions);
             }
         }

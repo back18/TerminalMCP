@@ -10,5 +10,7 @@ namespace TerminalMCP.Services
         public IReadOnlyList<string> GetProfiles();
 
         public nint Open(string profileName, string? workingDirectory);
+
+        public bool CloseTerminal(nint hwnd);
     }
 }

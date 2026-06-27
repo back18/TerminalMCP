@@ -138,13 +138,28 @@ Program.cs (入口)
 
 **实现位置**: `TerminalProcessService.LaunchTerminal()` 通过 `Process.Start` + `UseShellExecute` 启动 `wt.exe`。
 
+#### terminal_close — 关闭终端窗口
+
+**方法**: `TerminalClose(int hwnd)`
+
+**流程**:
+1. 验证 `hwnd` 是否为有效 WT 窗口
+2. Phase 1：`PostMessage(hwnd, WM_CLOSE, 0, 0)` — 非侵入式，不切焦点
+3. 等待 500ms 后检查窗口是否还存在 → 已关闭则返回 `success: true`
+4. Phase 2（回退）：`FocusWindow(hwnd)` + `Alt+F4`（`SendKeyCombo(VK_ALT, VK_F4)`）— 处理 UIPI 阻止的情况
+5. 等待 500ms 后再次检查 → 返回结果
+
+**副作用**: Phase 2 回退路径会切换窗口焦点并发送按键；Phase 1 无副作用。
+
+**实现位置**: `TerminalProcessService.CloseTerminal()`。
+
 ### 关键设计决策
 
 - **MCP 传输**：stdio JSON-RPC，由 `ModelContextProtocol` 库处理协议层
 - **终端发现**：通过 `EnumWindows` + 窗口类名 `CASCADIA_HOSTING_WINDOW_CLASS` 识别 WT 窗口
 - **内容捕获**：`Ctrl+Shift+A`（全选）→ `Ctrl+C`（复制）→ 读剪贴板，完成后恢复剪贴板原内容
 - **文本输入**：设置剪贴板 → `Ctrl+V` 粘贴
-- **按键发送**：`keybd_event` 发送虚拟键码（`NativeMethods.SendKey` / `NativeMethods.SendKeyCombo`）
+- **按键发送**：`keybd_event` 发送虚拟键码（`NativeMethods.SendKey` / `NativeMethods.SendKeyCombo`）。关闭窗口时 Alt+F4 作为 WM_CLOSE 被 UIPI 拦截后的回退手段
 - **捕获与输入分离**：`TerminalCaptureService`（只读观测）与 `TerminalInputService`（写入操作）为同级服务，通过共享 `IClipboardLockService` 互斥访问剪贴板
 - **剪贴板线程模型**：`ClipboardService` 在 STA 线程上执行剪贴板操作（Windows 剪贴板 API 要求）
 - **剪贴板锁**：`IClipboardLockService` → `ClipboardLockService`（单例 `SemaphoreSlim(1,1)`），同时注入 Capture 和 Input 两个服务，确保"备份→操作→恢复"原子性
@@ -161,7 +176,7 @@ Program.cs (入口)
 | `IClipboardService` → `ClipboardService` | Singleton | STA 线程剪贴板读写 |
 | `ITerminalCaptureService` → `TerminalCaptureService` | Singleton | 窗口枚举、内容捕获、基线管理、Read/Diff |
 | `ITerminalInputService` → `TerminalInputService` | Singleton | 文本粘贴（TypeText）、单键发送（SendKey）、键名映射 |
-| `ITerminalProcessService` → `TerminalProcessService` | Singleton | WT 配置文件读取、启动新终端窗口 |
+| `ITerminalProcessService` → `TerminalProcessService` | Singleton | WT 配置文件读取、启动/关闭终端窗口 |
 | `TerminalTools` | Singleton | MCP 工具注册，JSON 序列化响应 |
 
 ### 线程安全

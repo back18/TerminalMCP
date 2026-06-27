@@ -13,6 +13,7 @@
 - **发送按键**，响应交互式提示（`terminal_key`）
 - **列出**可用的 Windows Terminal 配置文件（`terminal_list_profiles`）
 - **打开**新的 Windows Terminal 窗口（`terminal_open`）
+- **关闭**指定的 Windows Terminal 窗口（`terminal_close`）
 
 ## 工具
 
@@ -25,6 +26,7 @@
 | `terminal_key` | 发送单个按键（Enter、Esc、Tab、Backspace、Delete、方向键、Home/End、Y/N、A/C/V/D 等） |
 | `terminal_list_profiles` | 列出可用的 Windows Terminal 配置文件（PowerShell、CMD、WSL 等） |
 | `terminal_open` | 打开新的 Windows Terminal 窗口，返回可用的 hwnd |
+| `terminal_close` | 关闭指定 hwnd 的终端窗口。先尝试 WM_CLOSE，失败则回退 Alt+F4 |
 
 ## 安装
 
@@ -91,6 +93,7 @@ terminal_key(hwnd, "up")                → 菜单导航
 # 打开新终端窗口
 terminal_list_profiles()                        → 列出可用配置文件
 terminal_open("Windows PowerShell", "C:\\work")  → 打开新窗口并返回 hwnd
+terminal_close(hwnd)                              → 关闭指定窗口
 ```
 
 ### 多窗口定位

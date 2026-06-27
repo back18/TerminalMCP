@@ -30,7 +30,10 @@ namespace TerminalMCP.Interop
         public const int VkRight = 0x27;
         public const int VkHome = 0x24;
         public const int VkEnd = 0x23;
+        public const int VkF4 = 0x73;
         public const int KeyeventfKeyup = 0x0002;
+
+        public const int WmClose = 0x0010;
 
         public const int SwRestore = 9;
 
@@ -66,6 +69,10 @@ namespace TerminalMCP.Interop
 
         [LibraryImport("user32.dll")]
         public static partial void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [LibraryImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static partial bool PostMessage(IntPtr hWnd, uint msg, UIntPtr wParam, IntPtr lParam);
 
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 

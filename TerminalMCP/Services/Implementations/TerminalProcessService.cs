@@ -107,6 +107,50 @@ namespace TerminalMCP.Services.Implementations
             }
         }
 
+        public bool CloseTerminal(nint hwnd)
+        {
+            if (!NativeMethods.IsWindow(hwnd))
+            {
+                _logger.LogWarning("CloseTerminal: invalid window hwnd=0x{hwnd:X}", hwnd);
+                return false;
+            }
+
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("CloseTerminal: hwnd=0x{hwnd:X} attempting PostMessage(WM_CLOSE)", hwnd);
+
+            // Phase 1: try PostMessage(WM_CLOSE) — non-intrusive, no focus steal
+            NativeMethods.PostMessage(hwnd, NativeMethods.WmClose, UIntPtr.Zero, IntPtr.Zero);
+            Thread.Sleep(500);
+
+            if (!NativeMethods.IsWindow(hwnd))
+            {
+                if (_logger.IsEnabled(LogLevel.Information))
+                    _logger.LogInformation("CloseTerminal: hwnd=0x{hwnd:X} closed via WM_CLOSE", hwnd);
+
+                return true;
+            }
+
+            // Phase 2: fallback — Alt+F4 via key injection (handles UIPI-blocked windows)
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("CloseTerminal: hwnd=0x{hwnd:X} WM_CLOSE did not close, falling back to Alt+F4", hwnd);
+
+            NativeMethods.FocusWindow(hwnd);
+            Thread.Sleep(200);
+            NativeMethods.SendKeyCombo(NativeMethods.VkAlt, NativeMethods.VkF4);
+            Thread.Sleep(500);
+
+            if (!NativeMethods.IsWindow(hwnd))
+            {
+                if (_logger.IsEnabled(LogLevel.Information))
+                    _logger.LogInformation("CloseTerminal: hwnd=0x{hwnd:X} closed via Alt+F4", hwnd);
+
+                return true;
+            }
+
+            _logger.LogWarning("CloseTerminal: failed to close hwnd=0x{hwnd:X} via both methods", hwnd);
+            return false;
+        }
+
         private static HashSet<nint> EnumTerminalWindows()
         {
             HashSet<nint> result = [];
