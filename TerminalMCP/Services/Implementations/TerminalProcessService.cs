@@ -119,15 +119,22 @@ namespace TerminalMCP.Services.Implementations
                 _logger.LogDebug("CloseTerminal: hwnd=0x{hwnd:X} attempting PostMessage(WM_CLOSE)", hwnd);
 
             // Phase 1: try PostMessage(WM_CLOSE) — non-intrusive, no focus steal
-            NativeMethods.PostMessage(hwnd, NativeMethods.WmClose, UIntPtr.Zero, IntPtr.Zero);
-            Thread.Sleep(500);
-
-            if (!NativeMethods.IsWindow(hwnd))
+            try
             {
-                if (_logger.IsEnabled(LogLevel.Information))
-                    _logger.LogInformation("CloseTerminal: hwnd=0x{hwnd:X} closed via WM_CLOSE", hwnd);
+                NativeMethods.PostMessage(hwnd, NativeMethods.WmClose, UIntPtr.Zero, IntPtr.Zero);
+                Thread.Sleep(500);
 
-                return true;
+                if (!NativeMethods.IsWindow(hwnd))
+                {
+                    if (_logger.IsEnabled(LogLevel.Information))
+                        _logger.LogInformation("CloseTerminal: hwnd=0x{hwnd:X} closed via WM_CLOSE", hwnd);
+
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "CloseTerminal: PostMessage failed for hwnd=0x{hwnd:X}, falling back to Alt+F4", hwnd);
             }
 
             // Phase 2: fallback — Alt+F4 via key injection (handles UIPI-blocked windows)
