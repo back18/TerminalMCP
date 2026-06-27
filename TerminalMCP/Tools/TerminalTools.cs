@@ -18,19 +18,23 @@ namespace TerminalMCP.Tools
     {
         public TerminalTools(
             ITerminalCaptureService captureService,
+            ITerminalInputService inputService,
             ITerminalProcessService processService,
             ILogger<TerminalTools> logger)
         {
             ArgumentNullException.ThrowIfNull(captureService, nameof(captureService));
+            ArgumentNullException.ThrowIfNull(inputService, nameof(inputService));
             ArgumentNullException.ThrowIfNull(processService, nameof(processService));
             ArgumentNullException.ThrowIfNull(logger, nameof(logger));
 
             _captureService = captureService;
+            _inputService = inputService;
             _processService = processService;
             _logger = logger;
         }
 
         private readonly ITerminalCaptureService _captureService;
+        private readonly ITerminalInputService _inputService;
         private readonly ITerminalProcessService _processService;
         private readonly ILogger<TerminalTools> _logger;
 
@@ -212,7 +216,7 @@ namespace TerminalMCP.Tools
                         JsonOptions);
                 }
 
-                InputResult result = _captureService.TypeText(hwnd, text, pressEnter);
+                InputResult result = _inputService.TypeText(hwnd, text, pressEnter);
 
                 if (!result.Success)
                 {
@@ -268,7 +272,7 @@ namespace TerminalMCP.Tools
                         JsonOptions);
                 }
 
-                KeyResult result = _captureService.SendKey(hwnd, key);
+                KeyResult result = _inputService.SendKey(hwnd, key);
 
                 if (!result.Success)
                 {

@@ -42,8 +42,10 @@ namespace TerminalMCP
 
         private void ConfigureServices(IServiceCollection services)
         {
+            services.AddSingleton<IClipboardLockService, ClipboardLockService>();
             services.AddSingleton<IClipboardService, ClipboardService>();
             services.AddSingleton<ITerminalCaptureService, TerminalCaptureService>();
+            services.AddSingleton<ITerminalInputService, TerminalInputService>();
             services.AddSingleton<ITerminalProcessService, TerminalProcessService>();
             services.AddSingleton<TerminalTools>();
 

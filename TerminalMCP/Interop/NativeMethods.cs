@@ -68,5 +68,51 @@ namespace TerminalMCP.Interop
         public static partial void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        public static bool FocusWindow(nint hwnd)
+        {
+            if (!IsWindow(hwnd))
+                return false;
+
+            if (IsIconic(hwnd))
+            {
+                ShowWindow(hwnd, SwRestore);
+                Thread.Sleep(300);
+            }
+
+            bool result = SetForegroundWindow(hwnd);
+            Thread.Sleep(200);
+            return result;
+        }
+
+        public static void SendKey(int vk)
+        {
+            keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
+            Thread.Sleep(30);
+            keybd_event((byte)vk, 0, KeyeventfKeyup, UIntPtr.Zero);
+            Thread.Sleep(30);
+        }
+
+        public static void SendKeyCombo(params int[] vks)
+        {
+            if (vks.Length == 0)
+                return;
+
+            // Press all keys
+            foreach (int vk in vks)
+            {
+                keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(30);
+            }
+
+            Thread.Sleep(50);
+
+            // Release all keys in reverse order
+            for (int i = vks.Length - 1; i >= 0; i--)
+            {
+                keybd_event((byte)vks[i], 0, KeyeventfKeyup, UIntPtr.Zero);
+                Thread.Sleep(30);
+            }
+        }
     }
 }

@@ -29,9 +29,13 @@ dotnet publish TerminalMCP/TerminalMCP.csproj -c Release -o TerminalMCP/bin/Rele
 Program.cs (入口)
   └─ ConsoleApp.cs (Host 构建器，DI 注册，MCP 服务器配置)
        └─ Tools/TerminalTools.cs (7 个 MCP 工具方法)
-            ├─ Services/ITerminalCaptureService.cs (终端交互核心)
-            │    ├─ Interop/NativeMethods.cs (Win32 P/Invoke)
+            ├─ Services/ITerminalCaptureService.cs (终端只读观测)
+            │    ├─ Interop/NativeMethods.cs (Win32 P/Invoke + FocusWindow/SendKey/SendKeyCombo)
             │    └─ Services/IClipboardService.cs (剪贴板读写)
+            ├─ Services/ITerminalInputService.cs (终端写入操作)
+            │    ├─ Interop/NativeMethods.cs
+            │    ├─ Services/IClipboardService.cs
+            │    └─ Services/IClipboardLockService.cs (剪贴板互斥锁)
             └─ Services/ITerminalProcessService.cs (终端进程管理)
                  └─ 读取 WT settings.json / 启动 wt.exe
 ```
@@ -48,11 +52,13 @@ Program.cs (入口)
 1. 若 `hwnd != 0` → 单窗口模式：验证窗口 → 聚焦 → 捕获内容 → 建立基线 → 返回 `TerminalInfo?`
 2. 调用 `EnumerateWindows()` — 通过 `EnumWindows` 枚举所有顶层窗口，筛选窗口类名为 `CASCADIA_HOSTING_WINDOW_CLASS` 的可见窗口
 3. 对于已在 `_windowCache` 中的已知窗口，只更新标题（从 `GetWindowTextW` 获取）
-4. 对于新发现的窗口，执行完整捕获流程：`FocusWindow` → `CaptureContent`（Ctrl+Shift+A 全选 → Ctrl+C 复制 → 读剪贴板 → 恢复剪贴板）→ 按换行符分割为 `string[]` 存入 `_baselines` → 取尾部 20 行作为 `tail_preview`
+4. 对于新发现的窗口，执行完整捕获流程：`NativeMethods.FocusWindow` → `CaptureContent`（Ctrl+Shift+A 全选 → Ctrl+C 复制 → 读剪贴板 → 恢复剪贴板）→ 按换行符分割为 `string[]` 存入 `_baselines` → 取尾部 20 行作为 `tail_preview`
 5. 清理 `_windowCache` 中已不存在的过期窗口
 6. 返回 `TerminalInitResult`，包含所有窗口的 `hwnd`、`title`、`line_count`、`tail_preview`
 
 **副作用**: 对新窗口会切换窗口焦点并使用剪贴板；对已知窗口无副作用。
+
+**用途**: 主要用途是窗口发现（获取可用的 hwnd 列表）。`terminal_read` 和 `terminal_diff` 在无基线时会自动建立基线，但需要先有 hwnd 才能调用——这就是必须先调 `terminal_init`（或 `terminal_open`）的原因。
 
 #### terminal_read — 读取缓存内容
 
@@ -60,12 +66,12 @@ Program.cs (入口)
 
 **流程**:
 1. 验证 `hwnd` 是否为有效 WT 窗口（`IsValidTerminalWindow`）
-2. 从 `_baselines` 读取缓存内容；若无基线则先执行一次捕获建立基线
+2. 从 `_baselines` 读取缓存内容；若无基线则先执行一次聚焦+捕获建立基线（Fallback 路径）
 3. 通过 `SliceLines` 切片：`offset` 为 1-based 倒序偏移（1=最后一行），从 `allLines.Length - offset - limit + 1` 位置开始取 `limit` 行
 4. 通过 `BuildLinesByDescending` 为每行添加倒序行号前缀（`5|Line 48` 格式），数字从 `limit + offset - 1` 递减到 `offset`，等宽对齐
 5. 返回 `ReadResult`：`hwnd`、`title`、`total_lines`、`lines_read`、`text`（每行带行号前缀）
 
-**特点**: 纯内存操作，不触碰终端或剪贴板，速度最快。
+**特点**: 有基线时纯内存操作，不触碰终端或剪贴板；无基线时降级为完整捕获。
 
 #### terminal_diff — 增量差异捕获
 
@@ -73,12 +79,12 @@ Program.cs (入口)
 
 **流程**:
 1. 验证窗口 → 聚焦窗口 → 捕获当前完整内容（Ctrl+Shift+A → Ctrl+C → 读剪贴板）
-2. 若无历史基线 → 建立基线，返回 `status: "init"` + 全部内容
+2. 若无历史基线 → 自动建立基线，返回 `status: "init"` + 全部内容
 3. 若有基线 → 行级前缀比对：从第 0 行开始逐行比较 `previousLines[i] == currentLines[i]`
-   - 在旧内容范围内未找到分叉 → 旧内容是当前内容的前缀，返回 `previousLines.Length..` 的追加行，通过 `BuildLines(appendedLines, previousLines.Length + 1)` 添加升序绝对行号
-   - 在旧内容范围内找到分叉 → 返回从分叉点到末尾的所有行，通过 `BuildLines(newLines, divergeLine + 1)` 添加升序绝对行号
+   - 在旧内容范围内未找到分叉 → 旧内容是当前内容的前缀，返回 `previousLines.Length..` 的新增/变更行
+   - 在旧内容范围内找到分叉 → 返回从分叉点到末尾的所有新行/变更行
 4. 更新 `_baselines` 为最新内容
-5. 返回 `DiffResult`：`status` 为 `"init"` / `"new"` / `"no_change"`，`text` 为新内容（每行带绝对行号前缀，如 `57|TEST LINE...`），`new_line_count` 为新行数
+5. 返回 `DiffResult`：`status` 为 `"init"`（首次捕获，无基线）/ `"new"`（有新行或变更行）/ `"no_change"`（内容未变），`text` 为新内容（每行带绝对行号前缀，如 `57|TEST LINE...`），`new_line_count` 为新行数
 
 **特点**: 必须与终端交互（聚焦 + 捕获），会短暂占用剪贴板。`"no_change"` 状态时 `text` 为空字符串。
 
@@ -88,10 +94,10 @@ Program.cs (入口)
 
 **流程**:
 1. 验证窗口 + 参数非空
-2. `_clipboardLock.Wait()` 获取剪贴板锁 → 备份当前剪贴板内容 → `ClipboardService.TrySetText(text)` 设置新内容 → `FocusWindow(hwnd)` → 发送 `Ctrl+V` 粘贴 → 若 `pressEnter=true` 则发送 `VK_RETURN` → 恢复剪贴板原内容 → 释放锁
+2. `_clipboardLockService.Wait()` 获取剪贴板锁 → 备份当前剪贴板内容 → `ClipboardService.TrySetText(text)` 设置新内容 → `NativeMethods.FocusWindow(hwnd)` → 发送 `Ctrl+V` 粘贴 → 若 `pressEnter=true` 则发送 `VK_RETURN` → 恢复剪贴板原内容 → 释放锁
 3. 返回 `InputResult`：`success: true/false`
 
-**实现位置**: `TerminalCaptureService.TypeText()`。关键常量：`VkCtrl = 0x11`、`VkV = 0x56`、`VkReturn = 0x0D`。
+**实现位置**: `TerminalInputService.TypeText()`。关键常量：`VkCtrl = 0x11`、`VkV = 0x56`、`VkReturn = 0x0D`。
 
 #### terminal_key — 按键发送
 
@@ -100,10 +106,10 @@ Program.cs (入口)
 **流程**:
 1. 验证窗口 + 参数非空
 2. `KeyNameToVk(key)` 将键名映射为虚拟键码 — 支持 `enter`/`return`、`escape`/`esc`、`tab`、`space`、`backspace`、`delete`/`del`、`up`/`down`/`left`/`right`、`home`、`end`、`y`、`n`、`a`、`c`、`v`、`d`
-3. `FocusWindow(hwnd)` → `keybd_event` 按下 → 30ms 延迟 → `keybd_event`（带 `KEYEVENTF_KEYUP`）释放
+3. `NativeMethods.FocusWindow(hwnd)` → `keybd_event` 按下 → 30ms 延迟 → `keybd_event`（带 `KEYEVENTF_KEYUP`）释放
 4. 返回 `KeyResult`：`success: true/false` + 实际发送的 `key`
 
-**实现位置**: `TerminalCaptureService.SendKey()`。组合键（如 `Ctrl+V`）通过 `SendKeyCombo` 实现：先按顺序按下所有键，再按逆序释放。
+**实现位置**: `TerminalInputService.SendKey()`。组合键（如 `Ctrl+V`）通过 `NativeMethods.SendKeyCombo` 实现：先按顺序按下所有键，再按逆序释放。
 
 #### terminal_list_profiles — 列出可用配置文件
 
@@ -138,8 +144,10 @@ Program.cs (入口)
 - **终端发现**：通过 `EnumWindows` + 窗口类名 `CASCADIA_HOSTING_WINDOW_CLASS` 识别 WT 窗口
 - **内容捕获**：`Ctrl+Shift+A`（全选）→ `Ctrl+C`（复制）→ 读剪贴板，完成后恢复剪贴板原内容
 - **文本输入**：设置剪贴板 → `Ctrl+V` 粘贴
-- **按键发送**：`keybd_event` 发送虚拟键码
+- **按键发送**：`keybd_event` 发送虚拟键码（`NativeMethods.SendKey` / `NativeMethods.SendKeyCombo`）
+- **捕获与输入分离**：`TerminalCaptureService`（只读观测）与 `TerminalInputService`（写入操作）为同级服务，通过共享 `IClipboardLockService` 互斥访问剪贴板
 - **剪贴板线程模型**：`ClipboardService` 在 STA 线程上执行剪贴板操作（Windows 剪贴板 API 要求）
+- **剪贴板锁**：`IClipboardLockService` → `ClipboardLockService`（单例 `SemaphoreSlim(1,1)`），同时注入 Capture 和 Input 两个服务，确保"备份→操作→恢复"原子性
 - **diff 算法**：行级前缀比对 — 从第一行开始逐行比较新旧内容，找到第一个分叉点
 - **单实例**：通过 named mutex (`Local\TerminalMCP_{hash}`) 确保每目录只运行一个实例
 - **日志**：使用 log4net，stdout 被 MCP JSON-RPC 占用，console appender 已注释，日志写入 `Logs/Latest.log` 和 `Logs/Debug.log`
@@ -148,15 +156,17 @@ Program.cs (入口)
 
 | 服务 | 生命周期 | 职责 |
 |:---|:---|:---|
+| `IClipboardLockService` → `ClipboardLockService` | Singleton | 剪贴板互斥锁，同时注入 Capture/Input 两个服务 |
 | `IClipboardService` → `ClipboardService` | Singleton | STA 线程剪贴板读写 |
-| `ITerminalCaptureService` → `TerminalCaptureService` | Singleton | 窗口枚举、内容捕获、diff、输入 |
+| `ITerminalCaptureService` → `TerminalCaptureService` | Singleton | 窗口枚举、内容捕获、基线管理、Read/Diff |
+| `ITerminalInputService` → `TerminalInputService` | Singleton | 文本粘贴（TypeText）、单键发送（SendKey）、键名映射 |
 | `ITerminalProcessService` → `TerminalProcessService` | Singleton | WT 配置文件读取、启动新终端窗口 |
 | `TerminalTools` | Singleton | MCP 工具注册，JSON 序列化响应 |
 
 ### 线程安全
 
 - `TerminalCaptureService` 使用 `ConcurrentDictionary<nint, string[]>` 存储 baselines，`ConcurrentDictionary<nint, TerminalInfo>` 缓存窗口信息
-- 剪贴板访问受 `SemaphoreSlim(1, 1)` 保护，防止并发读写冲突
+- 剪贴板访问受 `IClipboardLockService`（单例 `SemaphoreSlim(1, 1)`）保护，Capture 和 Input 两个服务共享同一锁实例，防止并发读写冲突
 - `ClipboardService` 使用 5 秒超时的 STA 线程
 
 ## 代码规范

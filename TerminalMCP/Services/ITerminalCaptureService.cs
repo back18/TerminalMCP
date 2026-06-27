@@ -17,10 +17,6 @@ namespace TerminalMCP.Services
 
         public DiffResult ReadDiff(nint hwnd);
 
-        public InputResult TypeText(nint hwnd, string text, bool pressEnter);
-
-        public KeyResult SendKey(nint hwnd, string key);
-
         public bool IsValidTerminalWindow(nint hwnd);
     }
 }

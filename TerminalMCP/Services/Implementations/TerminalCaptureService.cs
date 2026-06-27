@@ -9,20 +9,22 @@ namespace TerminalMCP.Services.Implementations
 {
     public class TerminalCaptureService : ITerminalCaptureService
     {
-        public TerminalCaptureService(ILogger<TerminalCaptureService> logger, IClipboardService clipboardService)
+        public TerminalCaptureService(IClipboardService clipboardService, IClipboardLockService clipboardLockService, ILogger<TerminalCaptureService> logger)
         {
             ArgumentNullException.ThrowIfNull(logger, nameof(logger));
             ArgumentNullException.ThrowIfNull(clipboardService, nameof(clipboardService));
+            ArgumentNullException.ThrowIfNull(clipboardLockService, nameof(clipboardLockService));
 
             _logger = logger;
             _clipboardService = clipboardService;
+            _clipboardLockService = clipboardLockService;
         }
 
         private readonly ILogger<TerminalCaptureService> _logger;
         private readonly IClipboardService _clipboardService;
+        private readonly IClipboardLockService _clipboardLockService;
         private readonly ConcurrentDictionary<nint, string[]> _baselines = new();
         private readonly ConcurrentDictionary<nint, TerminalInfo> _windowCache = new();
-        private readonly SemaphoreSlim _clipboardLock = new(1, 1);
         private bool _disposed;
 
         public IReadOnlyList<TerminalInfo> EnumerateWindows()
@@ -118,7 +120,7 @@ namespace TerminalMCP.Services.Implementations
                         continue;
 
                     // New window: capture content
-                    FocusWindow(info.Hwnd);
+                    NativeMethods.FocusWindow(info.Hwnd);
                     string? text = CaptureContent() ?? string.Empty;
                     string[] lines = SplitLines(text);
                     string tailPreview = string.Join("\n", lines[^Math.Min(20, lines.Length)..]);
@@ -151,7 +153,7 @@ namespace TerminalMCP.Services.Implementations
 
             string title = GetWindowTitle(hwnd);
 
-            FocusWindow(hwnd);
+            NativeMethods.FocusWindow(hwnd);
             string? text = CaptureContent() ?? string.Empty;
             string[] lines = SplitLines(text);
             string tailPreview = string.Join("\n", lines[^Math.Min(20, lines.Length)..]);
@@ -188,7 +190,7 @@ namespace TerminalMCP.Services.Implementations
                 if (_logger.IsEnabled(LogLevel.Debug))
                     _logger.LogDebug("ReadContent: hwnd=0x{hwnd:X} no baseline, capturing to establish", hwnd);
 
-                FocusWindow(hwnd);
+                NativeMethods.FocusWindow(hwnd);
                 string? text = CaptureContent();
                 if (text is null)
                 {
@@ -230,7 +232,7 @@ namespace TerminalMCP.Services.Implementations
                 return new DiffResult(hwnd.ToInt32(), currentTitle, 0, "init", string.Empty, 0);
             }
 
-            FocusWindow(hwnd);
+            NativeMethods.FocusWindow(hwnd);
             string? text = CaptureContent();
             if (text is null)
             {
@@ -293,68 +295,6 @@ namespace TerminalMCP.Services.Implementations
             return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, "new", fullDiffText, fullNewLineCount);
         }
 
-        public InputResult TypeText(nint hwnd, string text, bool pressEnter)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("TypeText: hwnd=0x{hwnd:X} textLen={len} pressEnter={enter}", hwnd, text.Length, pressEnter);
-
-            if (!IsValidTerminalWindow(hwnd))
-            {
-                _logger.LogWarning("TypeText: invalid window hwnd=0x{hwnd:X}", hwnd);
-                return new InputResult(false);
-            }
-
-            string? clipboardBackup = null;
-
-            _clipboardLock.Wait();
-            try
-            {
-                _clipboardService.TryReadText(out clipboardBackup);
-                if (!_clipboardService.TrySetText(text))
-                {
-                    _logger.LogWarning("TypeText: failed to set clipboard for hwnd=0x{hwnd:X}", hwnd);
-                    return new InputResult(false);
-                }
-
-                FocusWindow(hwnd);
-                Thread.Sleep(100);
-
-                // Ctrl+V
-                SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkV);
-                Thread.Sleep(100);
-
-                if (pressEnter)
-                {
-                    SendKey(NativeMethods.VkReturn);
-                    Thread.Sleep(30);
-                }
-
-                return new InputResult(true);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "TypeText: failed for hwnd=0x{hwnd:X}", hwnd);
-                return new InputResult(false);
-            }
-            finally
-            {
-                // Best-effort clipboard restore
-                try
-                {
-                    if (!string.IsNullOrEmpty(clipboardBackup))
-                        _clipboardService.TrySetText(clipboardBackup);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "TypeText: failed to restore clipboard for hwnd=0x{hwnd:X}", hwnd);
-                }
-
-                _clipboardLock.Release();
-            }
-        }
-
         public bool IsValidTerminalWindow(nint hwnd)
         {
             if (!NativeMethods.IsWindow(hwnd))
@@ -362,40 +302,6 @@ namespace TerminalMCP.Services.Implementations
 
             string className = GetWindowClassName(hwnd);
             return className == NativeMethods.WtClassName;
-        }
-
-        public KeyResult SendKey(nint hwnd, string key)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-
-            if (!IsValidTerminalWindow(hwnd))
-            {
-                _logger.LogWarning("SendKey: invalid window hwnd=0x{hwnd:X}", hwnd);
-                return new KeyResult(false, key);
-            }
-
-            try
-            {
-                int? vk = KeyNameToVk(key);
-                if (vk is null)
-                {
-                    _logger.LogWarning("SendKey: unknown key '{key}'", key);
-                    return new KeyResult(false, key);
-                }
-
-                FocusWindow(hwnd);
-                Thread.Sleep(50);
-                SendKey(vk.Value);
-
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("SendKey: sent key '{key}' (VK=0x{vk:X}) to hwnd=0x{hwnd:X}", key, vk.Value, hwnd);
-                return new KeyResult(true, key);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "SendKey: failed for hwnd=0x{hwnd:X} key='{key}'", hwnd, key);
-                return new KeyResult(false, key);
-            }
         }
 
         public void Dispose()
@@ -406,50 +312,33 @@ namespace TerminalMCP.Services.Implementations
             _disposed = true;
             _baselines.Clear();
             _windowCache.Clear();
-            _clipboardLock.Dispose();
 
             GC.SuppressFinalize(this);
-        }
-
-        private static bool FocusWindow(nint hwnd)
-        {
-            if (!NativeMethods.IsWindow(hwnd))
-                return false;
-
-            if (NativeMethods.IsIconic(hwnd))
-            {
-                NativeMethods.ShowWindow(hwnd, NativeMethods.SwRestore);
-                Thread.Sleep(300);
-            }
-
-            bool result = NativeMethods.SetForegroundWindow(hwnd);
-            Thread.Sleep(200);
-            return result;
         }
 
         private string? CaptureContent()
         {
             // Phase 1: backup clipboard (lock-protected)
             string? clipboardBackup = null;
-            _clipboardLock.Wait();
+            _clipboardLockService.Wait();
             try
             {
                 _clipboardService.TryReadText(out clipboardBackup);
             }
             finally
             {
-                _clipboardLock.Release();
+                _clipboardLockService.Release();
             }
 
             // Phase 2: send keystrokes (no lock needed — keyboard input is not clipboard)
             try
             {
                 // Ctrl+Shift+A (select all in Windows Terminal)
-                SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkShift, NativeMethods.VkA);
+                NativeMethods.SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkShift, NativeMethods.VkA);
                 Thread.Sleep(150);
 
                 // Ctrl+C (copy)
-                SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkC);
+                NativeMethods.SendKeyCombo(NativeMethods.VkCtrl, NativeMethods.VkC);
                 Thread.Sleep(150);
             }
             catch (Exception ex)
@@ -460,7 +349,7 @@ namespace TerminalMCP.Services.Implementations
             }
 
             // Phase 3: read captured content + restore clipboard (lock-protected)
-            _clipboardLock.Wait();
+            _clipboardLockService.Wait();
             try
             {
                 if (!_clipboardService.TryReadText(out var result))
@@ -481,7 +370,7 @@ namespace TerminalMCP.Services.Implementations
             }
             finally
             {
-                _clipboardLock.Release();
+                _clipboardLockService.Release();
             }
         }
 
@@ -498,36 +387,6 @@ namespace TerminalMCP.Services.Implementations
             {
                 _logger.LogWarning(ex, "RestoreClipboard: failed to restore clipboard content");
             }
-        }
-
-        private static void SendKeyCombo(params int[] vks)
-        {
-            if (vks.Length == 0)
-                return;
-
-            // Press all keys
-            foreach (int vk in vks)
-            {
-                NativeMethods.keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
-                Thread.Sleep(30);
-            }
-
-            Thread.Sleep(50);
-
-            // Release all keys in reverse order
-            for (int i = vks.Length - 1; i >= 0; i--)
-            {
-                NativeMethods.keybd_event((byte)vks[i], 0, NativeMethods.KeyeventfKeyup, UIntPtr.Zero);
-                Thread.Sleep(30);
-            }
-        }
-
-        private static void SendKey(int vk)
-        {
-            NativeMethods.keybd_event((byte)vk, 0, 0, UIntPtr.Zero);
-            Thread.Sleep(30);
-            NativeMethods.keybd_event((byte)vk, 0, NativeMethods.KeyeventfKeyup, UIntPtr.Zero);
-            Thread.Sleep(30);
         }
 
         private static string[] SliceLines(string[] allLines, int offset, int limit)
@@ -615,32 +474,6 @@ namespace TerminalMCP.Services.Implementations
             char[] classBuf = new char[256];
             NativeMethods.GetClassNameW(hwnd, classBuf, classBuf.Length);
             return new string(classBuf).TrimEnd('\0');
-        }
-
-        private static int? KeyNameToVk(string key)
-        {
-            return key.ToLowerInvariant() switch
-            {
-                "enter" or "return" => NativeMethods.VkReturn,
-                "escape" or "esc" => NativeMethods.VkEscape,
-                "tab" => NativeMethods.VkTab,
-                "space" => NativeMethods.VkSpace,
-                "backspace" => NativeMethods.VkBack,
-                "delete" or "del" => NativeMethods.VkDelete,
-                "up" => NativeMethods.VkUp,
-                "down" => NativeMethods.VkDown,
-                "left" => NativeMethods.VkLeft,
-                "right" => NativeMethods.VkRight,
-                "home" => NativeMethods.VkHome,
-                "end" => NativeMethods.VkEnd,
-                "y" => NativeMethods.VkY,
-                "n" => NativeMethods.VkN,
-                "a" => NativeMethods.VkA,
-                "c" => NativeMethods.VkC,
-                "v" => NativeMethods.VkV,
-                "d" => NativeMethods.VkD,
-                _ => null,
-            };
         }
     }
 }
