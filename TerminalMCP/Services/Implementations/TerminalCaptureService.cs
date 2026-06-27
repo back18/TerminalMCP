@@ -4,6 +4,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using TerminalMCP.Interop;
 using TerminalMCP.Models;
+using TerminalMCP.Utilities;
 
 namespace TerminalMCP.Services.Implementations
 {
@@ -125,7 +126,7 @@ namespace TerminalMCP.Services.Implementations
                     // New window: capture content
                     NativeMethods.FocusWindow(info.Hwnd);
                     string? text = CaptureContent() ?? string.Empty;
-                    string[] lines = SplitLines(text);
+                    string[] lines = TextHelper.SplitLines(text);
                     string tailPreview = string.Join("\n", lines[^Math.Min(20, lines.Length)..]);
 
                     if (_logger.IsEnabled(LogLevel.Debug))
@@ -158,7 +159,7 @@ namespace TerminalMCP.Services.Implementations
 
             NativeMethods.FocusWindow(hwnd);
             string? text = CaptureContent() ?? string.Empty;
-            string[] lines = SplitLines(text);
+            string[] lines = TextHelper.SplitLines(text);
             string tailPreview = string.Join("\n", lines[^Math.Min(20, lines.Length)..]);
 
             if (_logger.IsEnabled(LogLevel.Debug))
@@ -201,7 +202,7 @@ namespace TerminalMCP.Services.Implementations
                     return new ReadResult(hwnd.ToInt32(), currentTitle, 0, 0, string.Empty);
                 }
 
-                allLines = SplitLines(text);
+                allLines = TextHelper.SplitLines(text);
                 _baselines[hwnd] = allLines;
             }
 
@@ -209,10 +210,10 @@ namespace TerminalMCP.Services.Implementations
             int actualOffset = Math.Max(1, offset);
             int actualLimit = Math.Max(1, limit);
 
-            string[] sliced = SliceLines(allLines, actualOffset, actualLimit);
+            string[] sliced = TextHelper.SliceLines(allLines, actualOffset, actualLimit);
 
             // Prefix with descending line numbers (distance from bottom)
-            string readText = BuildLinesByDescending(sliced, actualOffset);
+            string readText = TextHelper.BuildLinesByDescending(sliced, actualOffset);
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("ReadContent: hwnd=0x{hwnd:X} totalLines={totalLines} returned={returned}", hwnd, totalLines, sliced.Length);
@@ -259,7 +260,7 @@ namespace TerminalMCP.Services.Implementations
                 return new DiffResult(hwnd.ToInt32(), currentTitle, 0, "init", string.Empty, 0);
             }
 
-            string[] currentLines = SplitLines(text);
+            string[] currentLines = TextHelper.SplitLines(text);
 
             if (!_baselines.TryGetValue(hwnd, out string[]? previousLines))
             {
@@ -268,50 +269,23 @@ namespace TerminalMCP.Services.Implementations
                     _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} init baseline, lines={count}", hwnd, currentLines.Length);
 
                 // Prefix with ascending absolute line numbers (1-based from top)
-                string initText = BuildLines(currentLines, 1);
+                string initText = TextHelper.BuildLines(currentLines, 1);
                 return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, "init",
                     initText, currentLines.Length);
             }
 
-            // Compare line by line from the beginning to find the first divergence
-            int divergeLine = 0;
-            int minLines = Math.Min(previousLines.Length, currentLines.Length);
-            while (divergeLine < minLines && previousLines[divergeLine] == currentLines[divergeLine])
-            {
-                divergeLine++;
-            }
-
-            // Old content is a prefix of new content — no divergence within old range
-            if (divergeLine >= previousLines.Length)
-            {
-                string[] appendedLines = currentLines[previousLines.Length..];
-                string diffText = BuildLines(appendedLines, previousLines.Length + 1);
-                int newLineCount = appendedLines.Length;
-
-                _baselines[hwnd] = currentLines;
-
-                string status = newLineCount > 0 ? "new" : "no_change";
-
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} status={status} divergeLine={divergeLine} newLines={newCount}",
-                        hwnd, status, divergeLine, newLineCount);
-
-                return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, status, diffText, newLineCount);
-            }
-
-            // Divergence found within the overlapping range
-            // Return everything from the divergence point to the end
-            string[] newLines = currentLines[divergeLine..];
-            string fullDiffText = BuildLines(newLines, divergeLine + 1);
-            int fullNewLineCount = newLines.Length;
+            DiffOutput diff = DiffCalculator.Compute(previousLines, currentLines);
+            string diffText = TextHelper.BuildLines(diff.NewLines, diff.StartLine);
+            int newLineCount = diff.NewLines.Length;
+            string status = diff.Status == DiffStatus.New ? "new" : "no_change";
 
             _baselines[hwnd] = currentLines;
 
             if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} status=new divergeLine={divergeLine}/{prevLines} newLines={newCount}",
-                    hwnd, divergeLine, previousLines.Length, fullNewLineCount);
+                _logger.LogDebug("ReadDiff: hwnd=0x{hwnd:X} status={status} newLines={newCount}",
+                    hwnd, status, newLineCount);
 
-            return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, "new", fullDiffText, fullNewLineCount);
+            return new DiffResult(hwnd.ToInt32(), currentTitle, currentLines.Length, status, diffText, newLineCount);
         }
 
         public bool IsValidTerminalWindow(nint hwnd)
@@ -409,78 +383,6 @@ namespace TerminalMCP.Services.Implementations
             }
         }
 
-        private static string[] SliceLines(string[] allLines, int offset, int limit)
-        {
-            // offset is 1-based from the end: offset=1 = last line
-            int startIdx = allLines.Length - offset - limit + 1;
-            if (startIdx < 0)
-            {
-                startIdx = 0;
-                limit = allLines.Length - offset + 1;
-                if (limit < 0)
-                    limit = 0;
-            }
-
-            int actualLimit = Math.Min(limit, allLines.Length - startIdx);
-            if (actualLimit <= 0)
-                return [];
-
-            string[] result = new string[actualLimit];
-            Array.Copy(allLines, startIdx, result, 0, actualLimit);
-            return result;
-        }
-
-        private static string[] SplitLines(string text)
-        {
-            string[] lines = text.Split(["\r\n", "\n", "\r"], StringSplitOptions.None);
-
-            int lastNonEmpty = lines.Length - 1;
-            while (lastNonEmpty >= 0 && string.IsNullOrEmpty(lines[lastNonEmpty]))
-                lastNonEmpty--;
-
-            if (lastNonEmpty == lines.Length - 1)
-                return lines;
-
-            return lines[..(lastNonEmpty + 1)];
-        }
-
-        private static string BuildLines(string[] lines, int start)
-        {
-            int line = start;
-            int width = (start + lines.Length - 1).ToString().Length;
-            StringBuilder stringBuilder = new();
-
-            for (int i = 0; i < lines.Length; i++)
-            {
-                stringBuilder.Append((line++).ToString().PadLeft(width));
-                stringBuilder.Append('|');
-                stringBuilder.AppendLine(lines[i]);
-            }
-
-            if (stringBuilder.Length > 0)
-                stringBuilder.Length--;
-
-            return stringBuilder.ToString();
-        }
-
-        private static string BuildLinesByDescending(string[] lines, int offset)
-        {
-            int line = lines.Length + offset - 1;
-            int width = line.ToString().Length;
-            StringBuilder stringBuilder = new();
-
-            for (int i = 0; i < lines.Length; i++)
-            {
-                stringBuilder.Append((line--).ToString().PadLeft(width));
-                stringBuilder.Append('|');
-                stringBuilder.AppendLine(lines[i]);
-            }
-
-            if (stringBuilder.Length > 0)
-                stringBuilder.Length--;
-
-            return stringBuilder.ToString();
-        }
 
         private static string GetWindowTitle(nint hwnd)
         {

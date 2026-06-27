@@ -21,23 +21,29 @@ dotnet publish TerminalMCP/TerminalMCP.csproj -c Release -o TerminalMCP/bin/Rele
 
 **使用 `.slnx` 解决方案文件**（`TerminalMCP.slnx`），与 `.sln` 等价。也可以直接操作 `TerminalMCP/TerminalMCP.csproj`。
 
-**没有测试项目**。验证功能需要通过真实 MCP 客户端（如 Hermes Agent）运行并调用 MCP 工具。
+**测试项目**: `TerminalMCP.Tests/TerminalMCP.Tests.csproj`（MSTest），覆盖 `TextHelper`、`KeyMapper`、`DiffCalculator` 三个纯逻辑模块。运行测试：
+
+```bash
+dotnet test TerminalMCP.slnx -c Debug
+```
 
 ## 架构
 
 ```
 Program.cs (入口)
   └─ ConsoleApp.cs (Host 构建器，DI 注册，MCP 服务器配置)
-       └─ Tools/TerminalTools.cs (7 个 MCP 工具方法)
+       └─ Tools/TerminalTools.cs (8 个 MCP 工具方法)
             ├─ Services/ITerminalCaptureService.cs (终端只读观测)
             │    ├─ Interop/NativeMethods.cs (Win32 P/Invoke + FocusWindow/SendKey/SendKeyCombo)
-            │    └─ Services/IClipboardService.cs (剪贴板读写)
+            │    ├─ Services/IClipboardService.cs (剪贴板读写)
+            │    └─ Utilities/DiffCalculator.cs (三阶段行级比对)
             ├─ Services/ITerminalInputService.cs (终端写入操作)
             │    ├─ Interop/NativeMethods.cs
             │    ├─ Services/IClipboardService.cs
-            │    └─ Services/IClipboardLockService.cs (剪贴板互斥锁)
+            │    ├─ Services/IClipboardLockService.cs (剪贴板互斥锁)
+            │    └─ Utilities/KeyMapper.cs (键名→虚拟键码)
             └─ Services/ITerminalProcessService.cs (终端进程管理)
-                 └─ 读取 WT settings.json / 启动 wt.exe
+                 └─ 读取 WT settings.json / 启动 wt.exe / 关闭终端
 ```
 
 ### MCP 工具详解
@@ -67,8 +73,8 @@ Program.cs (入口)
 **流程**:
 1. 验证 `hwnd` 是否为有效 WT 窗口（`IsValidTerminalWindow`）
 2. 从 `_baselines` 读取缓存内容；若无基线则先执行一次聚焦+捕获建立基线（Fallback 路径）
-3. 通过 `SliceLines` 切片：`offset` 为 1-based 倒序偏移（1=最后一行），从 `allLines.Length - offset - limit + 1` 位置开始取 `limit` 行
-4. 通过 `BuildLinesByDescending` 为每行添加倒序行号前缀（`5|Line 48` 格式），数字从 `limit + offset - 1` 递减到 `offset`，等宽对齐
+3. 通过 `TextHelper.SliceLines` 切片：`offset` 为 1-based 倒序偏移（1=最后一行），从 `allLines.Length - offset - limit + 1` 位置开始取 `limit` 行
+4. 通过 `TextHelper.BuildLinesByDescending` 为每行添加倒序行号前缀（`5|Line 48` 格式），数字从 `limit + offset - 1` 递减到 `offset`，等宽对齐
 5. 返回 `ReadResult`：`hwnd`、`title`、`total_lines`、`lines_read`、`text`（每行带行号前缀）
 
 **特点**: 有基线时纯内存操作，不触碰终端或剪贴板；无基线时降级为完整捕获。
@@ -80,13 +86,16 @@ Program.cs (入口)
 **流程**:
 1. 验证窗口 → 聚焦窗口 → 捕获当前完整内容（Ctrl+Shift+A → Ctrl+C → 读剪贴板）
 2. 若无历史基线 → 自动建立基线，返回 `status: "init"` + 全部内容
-3. 若有基线 → 行级前缀比对：从第 0 行开始逐行比较 `previousLines[i] == currentLines[i]`
-   - 在旧内容范围内未找到分叉 → 旧内容是当前内容的前缀，返回 `previousLines.Length..` 的新增/变更行
-   - 在旧内容范围内找到分叉 → 返回从分叉点到末尾的所有新行/变更行
+3. 若有基线 → 三阶段比对（`DiffCalculator.Compute`）：
+   - **Phase 1 前缀比对**: `previous[0] vs current[0]` 逐行比较 → 旧内容为前缀时返回追加行
+   - **Phase 2 锚点搜索**: `current[0]` 在 `previous` 中从前向后定位所有候选锚点，选连续匹配行数最多（≥3 或抵达 `previous` 末尾）的作为对齐点。若无合格候选则回退前缀分叉
+   - **Phase 3 锚点后扫描**: 从对齐点开始逐行比较，找到第一个差异行 → 返回后续所有行
 4. 更新 `_baselines` 为最新内容
 5. 返回 `DiffResult`：`status` 为 `"init"`（首次捕获，无基线）/ `"new"`（有新行或变更行）/ `"no_change"`（内容未变），`text` 为新内容（每行带绝对行号前缀，如 `57|TEST LINE...`），`new_line_count` 为新行数
 
 **特点**: 必须与终端交互（聚焦 + 捕获），会短暂占用剪贴板。`"no_change"` 状态时 `text` 为空字符串。内置每窗口 5 秒冷却（`_diffCooldowns`），同一 hwnd 在冷却时间内重复调用会 Sleep 等待，避免 AI 高频轮询浪费 Token。
+
+**缓冲区滚动处理**: 终端缓冲区达到上限时旧行从头部裁剪，Phase 2 的锚点搜索自动跳过已裁剪区域，在尾部找到最长重叠后返回真正新增的行。`DiffCalculatorTests`（41 个单元测试）覆盖正常追加、分叉、头部裁剪、锚点重试、大型缓冲区等场景。
 
 #### terminal_input — 文本输入
 
@@ -105,7 +114,7 @@ Program.cs (入口)
 
 **流程**:
 1. 验证窗口 + 参数非空
-2. `KeyNameToVk(key)` 将键名映射为虚拟键码 — 支持 `enter`/`return`、`escape`/`esc`、`tab`、`space`、`backspace`、`delete`/`del`、`up`/`down`/`left`/`right`、`home`、`end`、`y`、`n`、`a`、`c`、`v`、`d`
+2. `KeyMapper.KeyNameToVk(key)` 将键名映射为虚拟键码 — 支持 `enter`/`return`、`escape`/`esc`、`tab`、`space`、`backspace`、`delete`/`del`、`up`/`down`/`left`/`right`、`home`、`end`、`y`、`n`、`a`、`c`、`v`、`d`
 3. `NativeMethods.FocusWindow(hwnd)` → `keybd_event` 按下 → 30ms 延迟 → `keybd_event`（带 `KEYEVENTF_KEYUP`）释放
 4. 返回 `KeyResult`：`success: true/false` + 实际发送的 `key`
 
@@ -164,7 +173,8 @@ Program.cs (入口)
 - **剪贴板线程模型**：`ClipboardService` 在 STA 线程上执行剪贴板操作（Windows 剪贴板 API 要求）
 - **剪贴板锁**：`IClipboardLockService` → `ClipboardLockService`（单例 `SemaphoreSlim(1,1)`），同时注入 Capture 和 Input 两个服务，确保"备份→操作→恢复"原子性
 - **diff 冷却**：每个 hwnd 独立 5 秒冷却（`ConcurrentDictionary<nint, DateTime>`），同一窗口高频调用 `terminal_diff` 时内部 Sleep 等待，减少无意义的剪贴板操作和 Token 消耗
-- **diff 算法**：行级前缀比对 — 从第一行开始逐行比较新旧内容，找到第一个分叉点
+- **diff 算法**：三阶段比对——Phase 1 前缀（正常追加）、Phase 2 锚点搜索（缓冲区滚动时找最长重叠）、Phase 3 锚点后扫描（找差异行）。`DiffCalculator.Compute` 为纯函数，41 个单元测试覆盖
+- **纯逻辑可测试**：`TextHelper`、`KeyMapper`、`DiffCalculator` 从服务类中提取为 `internal static` 工具类，`TerminalMCP.Tests` 项目通过 `InternalsVisibleTo` 访问
 - **单实例**：通过 named mutex (`Local\TerminalMCP_{hash}`) 确保每目录只运行一个实例
 - **日志**：使用 log4net，stdout 被 MCP JSON-RPC 占用，console appender 已注释，日志写入 `Logs/Latest.log` 和 `Logs/Debug.log`
 
@@ -181,7 +191,7 @@ Program.cs (入口)
 
 ### 线程安全
 
-- `TerminalCaptureService` 使用 `ConcurrentDictionary<nint, string[]>` 存储 baselines，`ConcurrentDictionary<nint, TerminalInfo>` 缓存窗口信息
+- `TerminalCaptureService` 使用 `ConcurrentDictionary<nint, string[]>` 存储 baselines，`ConcurrentDictionary<nint, TerminalInfo>` 缓存窗口信息，`ConcurrentDictionary<nint, DateTime>` 存储 diff 冷却时间
 - 剪贴板访问受 `IClipboardLockService`（单例 `SemaphoreSlim(1, 1)`）保护，Capture 和 Input 两个服务共享同一锁实例，防止并发读写冲突
 - `ClipboardService` 使用 5 秒超时的 STA 线程
 

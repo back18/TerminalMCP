@@ -5,6 +5,7 @@ using System.Threading;
 using Microsoft.Extensions.Logging;
 using TerminalMCP.Interop;
 using TerminalMCP.Models;
+using TerminalMCP.Utilities;
 
 namespace TerminalMCP.Services.Implementations
 {
@@ -93,7 +94,7 @@ namespace TerminalMCP.Services.Implementations
 
             try
             {
-                int? vk = KeyNameToVk(key);
+                int? vk = KeyMapper.KeyNameToVk(key);
                 if (vk is null)
                 {
                     _logger.LogWarning("SendKey: unknown key '{key}'", key);
@@ -113,32 +114,6 @@ namespace TerminalMCP.Services.Implementations
                 _logger.LogError(ex, "SendKey: failed for hwnd=0x{hwnd:X} key='{key}'", hwnd, key);
                 return new KeyResult(false, key);
             }
-        }
-
-        private static int? KeyNameToVk(string key)
-        {
-            return key.ToLowerInvariant() switch
-            {
-                "enter" or "return" => NativeMethods.VkReturn,
-                "escape" or "esc" => NativeMethods.VkEscape,
-                "tab" => NativeMethods.VkTab,
-                "space" => NativeMethods.VkSpace,
-                "backspace" => NativeMethods.VkBack,
-                "delete" or "del" => NativeMethods.VkDelete,
-                "up" => NativeMethods.VkUp,
-                "down" => NativeMethods.VkDown,
-                "left" => NativeMethods.VkLeft,
-                "right" => NativeMethods.VkRight,
-                "home" => NativeMethods.VkHome,
-                "end" => NativeMethods.VkEnd,
-                "y" => NativeMethods.VkY,
-                "n" => NativeMethods.VkN,
-                "a" => NativeMethods.VkA,
-                "c" => NativeMethods.VkC,
-                "v" => NativeMethods.VkV,
-                "d" => NativeMethods.VkD,
-                _ => null,
-            };
         }
     }
 }
